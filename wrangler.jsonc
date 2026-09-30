@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sns-posting",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-09-01",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  // セッション保存用。id を省略すると初回デプロイ時に自動作成される
+  "kv_namespaces": [{ "binding": "SESSIONS" }],
+  "observability": { "enabled": true }
+}
