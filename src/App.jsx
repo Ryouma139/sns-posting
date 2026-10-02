@@ -365,10 +365,14 @@ function App() {
 
   // 下書きを作ったアカウントと連携中のアカウントが違えば、エラーを出して true を返す
   const rejectOtherAccountDraft = (item) => {
-    if (isSameAccount(item, accounts[item.platform]) !== false) return false
-    const message = `この下書きは @${item.accountUsername} で作成されています。@${item.accountUsername} を連携してから編集してください。`
+    const account = accounts[item.platform]
+    if (isSameAccount(item, account) !== false) return false
+    const label = platforms[item.platform].label
+    const message = !account.connected
+      ? `下書きを編集するには${label}アカウント${item.accountUsername ? `(@${item.accountUsername})` : ''}を連携してください。`
+      : `この下書きは @${item.accountUsername} で作成されています。@${item.accountUsername} を連携してから編集してください。`
     showError(message)
-    addNotification('error', `${platforms[item.platform].label}の下書きを開けませんでした`, message)
+    addNotification('error', `${label}の下書きを開けませんでした`, message)
     return true
   }
 
@@ -413,7 +417,7 @@ function App() {
       <div className="upcoming-row archive-row" key={item.id}>
         <div className="date-block"><b>{date.getDate()}</b><span>{date.getMonth() + 1}月</span></div>
         <button className="upcoming-content draft-open" onClick={() => openDraft(item)}>
-          <div className="upcoming-meta"><span className="draft-pill"><FileText size={13} /> 下書き</span>{showAccount && <span className="draft-pill account-pill-small">@{item.accountUsername}</span>}<span>{date.toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} に保存 · {item.text.length}文字</span></div>
+          <div className="upcoming-meta"><span className="draft-pill"><FileText size={13} /> 下書き</span>{showAccount && <span className="draft-pill account-pill-small">{item.accountUsername ? `@${item.accountUsername}` : 'アカウント不明'}</span>}<span>{date.toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} に保存 · {item.text.length}文字</span></div>
           <p>{item.text}</p>
         </button>
         <div className="scheduled-actions">

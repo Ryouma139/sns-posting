@@ -241,30 +241,4 @@ POST https://graph.threads.net/v1.0/me/threads_publish?creation_id=...&access_to
 
 ## 6. その他
 
-
-無料プランは枠を超えても自動課金されず、エラーで止まる。
-
-### API 利用状況の画面
-
-サイドバーの「**API利用状況**」(`#usage`)で、Threads の投稿・返信の上限と直近24時間の消費数を表示する。
-
-- Worker の `GET /api/threads/usage`(`threadsGetUsage`)が、Threads の `GET /{ユーザーID}/threads_publishing_limit?fields=quota_usage,config,reply_quota_usage,reply_config` を呼ぶ。返信の項目が取れなければ投稿の項目だけで取り直す。
-- 画面を開いたとき、「最新に更新」を押したときに取得する(1回 = Threads API 1回)。
-- API 呼び出し回数の上限(24時間で 4,800 × 表示回数)の残りは API から取得できないため、表示していない。
-- X は Developer Portal の Usage で確認する。
-
-### 取得件数(最新20件)
-
-- 固定値。[src/App.jsx](../src/App.jsx) の `archiveLimit`、[worker/index.js](../worker/index.js) の Threads `limit=20` と X `max_results: '20'` の3か所。変えるときはそろえる。
-- 分析画面の見出しは、実際に集計した件数を表示する(いいね数を取れなかった投稿は集計から外れるため、20件より少ないことがある)。
-- Threads は投稿1件ごとに insights を1回呼ぶ。Workers 無料プランのサブリクエスト上限(1リクエスト50回)があるため、**40件程度まで**が安全。
-
-### 予約投稿(現状)
-
-- 予約は**ブラウザの localStorage に保存するだけ**。時刻になっても**自動では投稿しない**。「予定時刻を過ぎています」と表示され、「今すぐ投稿」を手で押す必要がある。
-- 開発サーバーを止めても予約は消えないが、投稿もされない。
-- localStorage は URL(オリジン)ごとに別なので、**開発(localhost:5173)で予約した内容は本番に表示されない**。別ブラウザ・スマホでも表示されない。下書きと通知も同じ。
-- 予約には**予約したアカウント**(`accountId`、`accountUsername`)を保存する。予約するにはアカウントの連携が必要。
-- 予約一覧は、連携中のアカウントの予約を上に、ほかのアカウントの予約を「ほかのアカウントの予約」として `@ユーザー名` 付きで下に表示する。
-- 「今すぐ投稿」を押したとき、予約したアカウントと連携中のアカウントが違えば**投稿せずに警告**する。Worker 側でも `accountId` を照合し、違えば 409 を返す(`accountMismatch`)。アカウントが記録されていない古い予約は、確認ダイアログを出してから連携中のアカウントで投稿する。
-- 自動投稿にするには、予約を KV に保存し、Cloudflare の **Cron Trigger**(無料プランで使える)で定期的に投稿する仕組みが必要(未実装)。
+API 利用状況の画面、取得件数、予約投稿、下書きの仕様は [app-features.md](app-features.md) に移した。
