@@ -547,7 +547,7 @@ function App() {
           )}
           {view === 'analytics' && (
             <>
-              <section className="intro"><div><p className="eyebrow">最新{archiveLimit}件の投稿</p><h1>投稿の反応<span>。</span></h1><p className="subcopy">投稿アーカイブで取得した最新{archiveLimit}件をもとに集計しています。</p></div></section>
+              <section className="intro"><div><p className="eyebrow">最新{analyzedPosts.length || archiveLimit}件の投稿</p><h1>投稿の反応<span>。</span></h1><p className="subcopy">{analyzedPosts.length > 0 ? `投稿アーカイブで取得した最新${analyzedPosts.length}件をもとに集計しています。` : `投稿アーカイブで取得した最新${archiveLimit}件までをもとに集計します。`}</p></div></section>
               {!isConnected ? connectionCard : (
                 <>
                   {analyzedPosts.length > 0 && (
