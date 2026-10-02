@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import { Archive, BarChart3, Heart, LogOut, MapPin, MessageCircle, Repeat2, Bell, CalendarDays, AlertCircle, Check, ChevronDown, Info, Clock3, Command, ExternalLink, FileText, Gauge, Hash, Image, LayoutDashboard, Link2, MoreHorizontal, Paperclip, PenLine, Send, Settings2, Sparkles, Trash2, X } from 'lucide-react'
+import { Archive, BarChart3, Heart, LogOut, MapPin, MessageCircle, Repeat2, Search, TrendingUp, Bell, CalendarDays, AlertCircle, Check, ChevronDown, Info, Clock3, Command, ExternalLink, FileText, Gauge, Hash, Image, LayoutDashboard, Link2, MoreHorizontal, Paperclip, PenLine, Send, Settings2, Sparkles, Trash2, X } from 'lucide-react'
 import './App.css'
 
 // サイドバーから切り替える画面(それ以外のハッシュは概要画面内の位置として扱う)
-const pageTitles = { dashboard: '概要', compose: '作成', analytics: '分析', drafts: '下書き', usage: 'API利用状況' }
+const pageTitles = { dashboard: '概要', compose: '作成', analytics: '分析', trends: 'トレンド検索', drafts: '下書き', usage: 'API利用状況' }
 
 function getViewFromHash(hash) {
   return pageTitles[hash] ? hash : 'dashboard'
@@ -295,6 +295,32 @@ function App() {
     // 編集中の下書きは元のSNSのものなので、切り替えたら新規作成として扱う
     setEditingDraftId(null)
   }
+  // トレンド検索(Threads のキーワード検索)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchType, setSearchType] = useState('TOP')
+  const [searchPeriod, setSearchPeriod] = useState('7d')
+  const [searchResults, setSearchResults] = useState(null)
+  const [searchError, setSearchError] = useState('')
+  const [isSearching, setIsSearching] = useState(false)
+  const handleSearch = async (event) => {
+    event.preventDefault()
+    const q = searchQuery.trim()
+    if (!q || isSearching) return
+    setIsSearching(true)
+    setSearchError('')
+    try {
+      const response = await fetch(`/api/threads/search?${new URLSearchParams({ q, type: searchType, period: searchPeriod })}`)
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || `エラー ${response.status}`)
+      setSearchResults({ q, posts: result.posts })
+    } catch (searchFailure) {
+      setSearchResults(null)
+      setSearchError(searchFailure.message || '検索に失敗しました。')
+    } finally {
+      setIsSearching(false)
+    }
+  }
+
   // API利用状況(Threadsの投稿・返信の上限と直近24時間の消費数)
   const [usage, setUsage] = useState(null)
   const [usageError, setUsageError] = useState('')
@@ -516,7 +542,7 @@ function App() {
             </div>
           )}
         </div>
-        <nav><p className="nav-label">メニュー</p><a className={view === 'dashboard' ? 'active' : undefined} href="#dashboard"><LayoutDashboard size={17} /> 概要</a><a className={view === 'compose' ? 'active' : undefined} href="#compose"><PenLine size={17} /> 作成 <span className="nav-count">1</span></a><a href="#calendar"><CalendarDays size={17} /> カレンダー</a><a className={view === 'analytics' ? 'active' : undefined} href="#analytics"><BarChart3 size={17} /> 分析</a><p className="nav-label">管理</p><a className={view === 'drafts' ? 'active' : undefined} href="#drafts"><FileText size={17} /> 下書き {sortedDrafts.length > 0 && <span className="nav-count muted">{sortedDrafts.length}</span>}</a><a href="#settings"><Settings2 size={17} /> 設定</a><a href="#archive"><Archive size={17} /> 投稿アーカイブ</a><a className={view === 'usage' ? 'active' : undefined} href="#usage"><Gauge size={17} /> API利用状況</a></nav>
+        <nav><p className="nav-label">メニュー</p><a className={view === 'dashboard' ? 'active' : undefined} href="#dashboard"><LayoutDashboard size={17} /> 概要</a><a className={view === 'compose' ? 'active' : undefined} href="#compose"><PenLine size={17} /> 作成 <span className="nav-count">1</span></a><a href="#calendar"><CalendarDays size={17} /> カレンダー</a><a className={view === 'analytics' ? 'active' : undefined} href="#analytics"><BarChart3 size={17} /> 分析</a><a className={view === 'trends' ? 'active' : undefined} href="#trends"><TrendingUp size={17} /> トレンド検索</a><p className="nav-label">管理</p><a className={view === 'drafts' ? 'active' : undefined} href="#drafts"><FileText size={17} /> 下書き {sortedDrafts.length > 0 && <span className="nav-count muted">{sortedDrafts.length}</span>}</a><a href="#settings"><Settings2 size={17} /> 設定</a><a href="#archive"><Archive size={17} /> 投稿アーカイブ</a><a className={view === 'usage' ? 'active' : undefined} href="#usage"><Gauge size={17} /> API利用状況</a></nav>
         <div className="sidebar-foot"><div className="help-icon"><Sparkles size={17} /></div><div><strong>お困りですか？</strong><small>クイックガイドを読む</small></div><ExternalLink size={14} /></div>
       </aside>
       <main className="main-content" id="dashboard">
@@ -630,6 +656,46 @@ function App() {
                   {otherDrafts.map((item) => renderDraftRow(item, true))}
                 </div>
               </section>
+            </>
+          )}
+          {view === 'trends' && (
+            <>
+              <section className="intro"><div><p className="eyebrow">{platformInfo.label} · キーワード検索</p><h1>トレンド検索<span>。</span></h1><p className="subcopy">キーワードを含む Threads の投稿を、人気順または新着順で表示します。</p></div></section>
+              {platform !== 'threads' ? (
+                <p className="archive-empty usage-note">トレンド検索は Threads のみ対応しています。左上のワークスペースを Threads に切り替えてください。</p>
+              ) : !isConnected ? connectionCard : (
+                <>
+                  <form className="trend-search" onSubmit={handleSearch}>
+                    <label className="trend-input"><Search size={16} /><input type="search" value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="キーワードを入力" maxLength={100} aria-label="キーワード" /></label>
+                    <select value={searchType} onChange={(event) => setSearchType(event.target.value)} aria-label="並び順"><option value="TOP">人気順</option><option value="RECENT">新着順</option></select>
+                    <select value={searchPeriod} onChange={(event) => setSearchPeriod(event.target.value)} aria-label="期間"><option value="1d">24時間以内</option><option value="7d">7日以内</option><option value="30d">30日以内</option><option value="all">期間指定なし</option></select>
+                    <button type="submit" className="post-button" disabled={!searchQuery.trim() || isSearching}>{isSearching ? '検索中...' : '検索'}</button>
+                  </form>
+                  <p className="archive-note trend-note">アプリが審査(アドバンスアクセス)を通過するまでは、連携中のアカウント自身の投稿だけが検索されます。ほかの人の投稿のいいね数は API で取得できないため、人気順は Threads の判断による並びです。</p>
+                  {searchError && <p className="archive-empty usage-note">{searchError}</p>}
+                  {searchResults && (
+                    <section className="archive-section">
+                      <div className="section-heading compact"><div><p className="eyebrow">{searchType === 'TOP' ? '人気順' : '新着順'} · {searchResults.posts.length}件</p><h2>「{searchResults.q}」の検索結果</h2></div></div>
+                      <div className="recent-section">
+                        {searchResults.posts.length === 0 && <p className="archive-empty">該当する投稿はありませんでした。</p>}
+                        {searchResults.posts.map((item) => {
+                          const date = new Date(item.created_at)
+                          return (
+                            <div className="upcoming-row archive-row" key={item.id}>
+                              <div className="date-block"><b>{date.getDate()}</b><span>{date.getMonth() + 1}月</span></div>
+                              <div className="upcoming-content">
+                                <div className="upcoming-meta">{item.username && <span className="draft-pill account-pill-small">@{item.username}</span>}<span>{date.toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span></div>
+                                <p>{item.text || `(${item.mediaType || 'テキストなし'})`}</p>
+                              </div>
+                              {item.permalink && <div className="scheduled-actions"><a className="more-button" href={item.permalink} target="_blank" rel="noreferrer" aria-label="Threadsで見る" title="Threadsで見る"><ExternalLink size={16} /></a></div>}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </section>
+                  )}
+                </>
+              )}
             </>
           )}
           {view === 'usage' && (

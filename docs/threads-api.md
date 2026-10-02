@@ -62,7 +62,8 @@ Meta ビジネスポートフォリオ(会社・事業の入れ物)
 | `threads_basic` | プロフィール・自分の投稿一覧の取得 | [worker/index.js](../worker/index.js) `threadsCallback` / `threadsGetPosts` | 必須(最初から入っている) |
 | `threads_content_publish` | **投稿** | `threadsCreatePost` | 必須 |
 | `threads_manage_insights` | いいね・返信・表示回数などの取得 | `loadThreadsMetrics` | 必須 |
-| `threads_delete`、`threads_keyword_search`、`threads_location_tagging` など | 削除・検索・位置情報 | 使っていない | 不要 |
+| `threads_keyword_search` | キーワード検索 | `threadsSearch`(トレンド検索) | 使う。審査前は自分の投稿のみ |
+| `threads_delete`、`threads_location_tagging` など | 削除・位置情報 | 使っていない | 不要 |
 
 - ステータスの「**テスト準備完了**」= 開発モードで、**テスターなら使える**状態。自分で使う分には審査なしで投稿できる。
 - 「API 呼び出し」の数は反映に数時間〜1日かかる。0 のままでも問題ない。

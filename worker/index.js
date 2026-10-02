@@ -191,7 +191,7 @@ function threadsError(error, fallback) {
 function threadsConnect(request, env) {
   if (!env.THREADS_APP_ID || !env.THREADS_APP_SECRET) return redirect('/?threads_error=config')
   const state = randomHex(24)
-  const params = new URLSearchParams({ client_id: env.THREADS_APP_ID, redirect_uri: redirectUri(env, request, 'THREADS_REDIRECT_URI', 'threads'), scope: 'threads_basic,threads_content_publish,threads_manage_insights', response_type: 'code', state })
+  const params = new URLSearchParams({ client_id: env.THREADS_APP_ID, redirect_uri: redirectUri(env, request, 'THREADS_REDIRECT_URI', 'threads'), scope: 'threads_basic,threads_content_publish,threads_manage_insights,threads_keyword_search', response_type: 'code', state })
   return startOAuth(`https://threads.net/oauth/authorize?${params}`, { provider: 'threads', state })
 }
 
@@ -275,6 +275,28 @@ async function threadsCreatePost(request, session) {
 
 // ---- ルーティング ----
 
+// キーワード検索(threads_keyword_search)。審査前は自分の投稿しか返らない
+const searchPeriods = { '1d': 86400, '7d': 7 * 86400, '30d': 30 * 86400 }
+
+async function threadsSearch(session, url) {
+  const threads = session.data.threads
+  if (!threads?.accessToken) return json({ error: 'Threadsアカウントが連携されていません。' }, 401)
+  const q = (url.searchParams.get('q') || '').trim()
+  if (!q || q.length > 100) return json({ error: 'キーワードは1文字以上100文字以内で入力してください。' }, 400)
+  // TOP = Threads が人気と判断した順、RECENT = 新着順
+  const searchType = url.searchParams.get('type') === 'RECENT' ? 'RECENT' : 'TOP'
+  const params = new URLSearchParams({ q, search_type: searchType, fields: 'id,text,username,permalink,timestamp,media_type', limit: '25' })
+  const period = searchPeriods[url.searchParams.get('period')]
+  if (period) params.set('since', String(Math.floor(Date.now() / 1000) - period))
+  try {
+    const result = await threadsFetch(`/v1.0/keyword_search?${params}`, threads.accessToken)
+    const posts = (result.data || []).map((item) => ({ id: item.id, text: item.text || '', username: item.username || '', permalink: item.permalink || '', created_at: item.timestamp, mediaType: item.media_type || '' }))
+    return json({ posts })
+  } catch (searchError) {
+    return threadsError(searchError, '検索に失敗しました。')
+  }
+}
+
 // 投稿・返信の上限と、直近24時間の消費数(Threads の threads_publishing_limit)
 async function threadsGetUsage(session) {
   const threads = session.data.threads
@@ -325,6 +347,7 @@ async function route(request, env, session, url) {
       return json({ connected: false })
     case 'GET /api/threads/posts': return threadsGetPosts(session)
     case 'GET /api/threads/usage': return threadsGetUsage(session)
+    case 'GET /api/threads/search': return threadsSearch(session, url)
     case 'POST /api/threads/posts': return threadsCreatePost(request, session)
     default: return json({ error: 'Not Found' }, 404)
   }
