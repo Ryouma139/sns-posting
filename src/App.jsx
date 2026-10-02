@@ -118,6 +118,10 @@ function App() {
   // 添付画像 { id, file, url }。url はプレビュー用の blob URL。下書き・予約には保存しない
   const [images, setImages] = useState([])
   const imageInputRef = useRef(null)
+  // Threads のトピックタグ(1投稿に1つ)。本文に「#」で書くと本文にも残るため、別の欄で入力して topic_tag で送る
+  const [topicTag, setTopicTag] = useState('')
+  const topicTagInputRef = useRef(null)
+  const textareaRef = useRef(null)
   const [platform, setPlatform] = useState(loadStoredPlatform)
   const [accounts, setAccounts] = useState({ x: emptyAccount, threads: emptyAccount })
   const [archives, setArchives] = useState({ x: emptyArchive, threads: emptyArchive })
@@ -368,18 +372,21 @@ function App() {
 
   // accountId を渡すと、Worker 側でも連携中のアカウントと一致するか確認する
   // attachments: 添付画像の File。画像があるときだけ multipart/form-data で送る
-  const publishPost = async (text, target = platform, accountId = '', attachments = []) => {
+  // tag: Threads のトピックタグ(X では使わない)
+  const publishPost = async (text, target = platform, accountId = '', attachments = [], tag = '') => {
+    const sentTag = target === 'threads' ? tag.trim().replace(/^#+/, '') : ''
     const label = platforms[target].label
     if ((!text.trim() && attachments.length === 0) || !accounts[target].connected || isPosting) return false
     setIsPosting(true)
     let response
     let result
     try {
-      let request = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, accountId }) }
+      let request = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, accountId, topicTag: sentTag }) }
       if (attachments.length) {
         const form = new FormData()
         form.append('text', text)
         form.append('accountId', accountId)
+        form.append('topicTag', sentTag)
         for (const file of attachments) form.append('images', file)
         request = { method: 'POST', body: form }
       }
@@ -397,7 +404,7 @@ function App() {
       addNotification('error', `${label}への投稿に失敗しました`, result.error || `エラー ${response.status}`)
       return false
     }
-    addNotification('success', `${label}へ投稿しました`, [result.text, attachments.length ? `画像${attachments.length}枚` : ''].filter(Boolean).join(' · '))
+    addNotification('success', `${label}へ投稿しました`, [result.text, sentTag ? `#${sentTag}` : '', attachments.length ? `画像${attachments.length}枚` : ''].filter(Boolean).join(' · '))
     setIsNoticeError(false)
     setNotice(`${label}へ投稿しました`)
     updateArchive(target, (current) => ({ posts: [{ id: result.id, text: result.text, created_at: new Date().toISOString() }, ...current.posts].slice(0, archiveLimit) }))
@@ -406,8 +413,9 @@ function App() {
   }
 
   const handlePost = async () => {
-    if (await publishPost(post, platform, '', images.map((item) => item.file))) {
+    if (await publishPost(post, platform, '', images.map((item) => item.file), topicTag)) {
       setPost('')
+      setTopicTag('')
       clearImages()
       finishEditingDraft()
     }
@@ -440,6 +448,27 @@ function App() {
   })
 
   // 画像はブラウザに保存できない大きさのため、下書き・予約には本文だけを残す
+  // Threads のタグの確認(Worker 側の validateTopicTag と同じ条件)
+  const cleanTopicTag = topicTag.trim().replace(/^#+/, '')
+  const topicTagError = platform === 'threads' && (cleanTopicTag.length > 50 || /[.&]/.test(cleanTopicTag)) ? 'タグは50文字以内で、「.」と「&」は使えません。' : ''
+  // 本文に # のタグを書いていると、本文にそのまま残る
+  const hasInlineTag = platform === 'threads' && /(^|s)#[^s#.&@!?,;:]/.test(post)
+
+  // #ボタン: Threads はタグ欄へ移動、X は本文のカーソル位置に「#」を入れる
+  const handleHashButton = () => {
+    if (platform === 'threads') { topicTagInputRef.current?.focus(); return }
+    const textarea = textareaRef.current
+    const start = textarea?.selectionStart ?? post.length
+    const end = textarea?.selectionEnd ?? post.length
+    const before = post.slice(0, start)
+    const insert = before && !/s$/.test(before) ? ' #' : '#'
+    setPost((post.slice(0, start) + insert + post.slice(end)).slice(0, maxCharacters))
+    window.requestAnimationFrame(() => {
+      textarea?.focus()
+      textarea?.setSelectionRange(start + insert.length, start + insert.length)
+    })
+  }
+
   const imageNotSavedNote = images.length ? '(画像は保存されません)' : ''
 
   // 投稿・予約した下書きは一覧から消す
@@ -468,12 +497,13 @@ function App() {
     const updatedAt = new Date().toISOString()
     // 下書きには作成したアカウントを残す(アカウント不明の古い下書きは、保存したアカウントのものにする)
     const owner = { accountId: accounts[platform].userId, accountUsername: username }
+    const tag = platform === 'threads' ? topicTag.trim().replace(/^#+/, '') : ''
     const editingDraft = editingDraftId && drafts.find((item) => item.id === editingDraftId)
     if (editingDraft) {
       if (rejectOtherAccountDraft(editingDraft)) return
-      setDrafts((current) => current.map((item) => item.id === editingDraftId ? { ...item, ...(item.accountId || item.accountUsername ? {} : owner), text, updatedAt } : item))
+      setDrafts((current) => current.map((item) => item.id === editingDraftId ? { ...item, ...(item.accountId || item.accountUsername ? {} : owner), text, topicTag: tag, updatedAt } : item))
     } else {
-      const item = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, platform, ...owner, text, createdAt: updatedAt, updatedAt }
+      const item = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, platform, ...owner, text, topicTag: tag, createdAt: updatedAt, updatedAt }
       setDrafts((current) => [...current, item])
       setEditingDraftId(item.id)
     }
@@ -485,6 +515,7 @@ function App() {
   const openDraft = (item) => {
     if (rejectOtherAccountDraft(item)) return
     setPost(item.text.slice(0, maxCharacters))
+    setTopicTag(item.topicTag || '')
     setEditingDraftId(item.id)
     setIsScheduleOpen(false)
     window.location.hash = 'compose'
@@ -502,7 +533,7 @@ function App() {
       <div className="upcoming-row archive-row" key={item.id}>
         <div className="date-block"><b>{date.getDate()}</b><span>{date.getMonth() + 1}月</span></div>
         <button className="upcoming-content draft-open" onClick={() => openDraft(item)}>
-          <div className="upcoming-meta"><span className="draft-pill"><FileText size={13} /> 下書き</span>{showAccount && <span className="draft-pill account-pill-small">{item.accountUsername ? `@${item.accountUsername}` : 'アカウント不明'}</span>}<span>{date.toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} に保存 · {item.text.length}文字</span></div>
+          <div className="upcoming-meta"><span className="draft-pill"><FileText size={13} /> 下書き</span>{item.topicTag && <span className="draft-pill account-pill-small">#{item.topicTag}</span>}{showAccount && <span className="draft-pill account-pill-small">{item.accountUsername ? `@${item.accountUsername}` : 'アカウント不明'}</span>}<span>{date.toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} に保存 · {item.text.length}文字</span></div>
           <p>{item.text}</p>
         </button>
         <div className="scheduled-actions">
@@ -515,6 +546,7 @@ function App() {
 
   const startNewPost = () => {
     setPost('')
+    setTopicTag('')
     clearImages()
     setEditingDraftId(null)
     setIsScheduleOpen(false)
@@ -535,10 +567,11 @@ function App() {
     if (scheduledAt <= new Date()) { showError('予約日時は現在より後の日時を指定してください。'); return }
     if (!isConnected) { showError(`予約するには${platformInfo.label}アカウントを連携してください。`); return }
     // どのアカウントで予約したかを残し、別のアカウントから投稿しないようにする
-    const item = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, platform, accountId: accounts[platform].userId, accountUsername: username, text: post.trim(), scheduledAt: scheduledAt.toISOString(), createdAt: new Date().toISOString() }
+    const item = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, platform, accountId: accounts[platform].userId, accountUsername: username, text: post.trim(), topicTag: platform === 'threads' ? topicTag.trim().replace(/^#+/, '') : '', scheduledAt: scheduledAt.toISOString(), createdAt: new Date().toISOString() }
     setScheduledPosts((current) => [...current, item])
     setIsScheduleOpen(false)
     setPost('')
+    setTopicTag('')
     clearImages()
     finishEditingDraft()
     setIsNoticeError(false)
@@ -560,7 +593,7 @@ function App() {
       return
     }
     if (same === null && !window.confirm(`予約したアカウントが記録されていない予約です。連携中の @${account.username} から投稿しますか？`)) return
-    if (await publishPost(item.text, target, item.accountId || '')) removeScheduled(item.id)
+    if (await publishPost(item.text, target, item.accountId || '', [], item.topicTag || '')) removeScheduled(item.id)
   }
 
   // showAccount: 別アカウント・アカウント不明の予約には、予約したアカウント名を表示する
@@ -571,7 +604,7 @@ function App() {
       <div className="upcoming-row archive-row" key={item.id}>
         <div className="date-block"><b>{date.getDate()}</b><span>{date.getMonth() + 1}月</span></div>
         <div className="upcoming-content">
-          <div className="upcoming-meta">{isOverdue ? <span className="draft-pill overdue-pill"><AlertCircle size={13} /> 予定時刻を過ぎています</span> : <span className="scheduled-pill"><Clock3 size={13} /> 予約済み</span>}{showAccount && <span className="draft-pill account-pill-small">{item.accountUsername ? `@${item.accountUsername}` : 'アカウント不明'}</span>}<span>{formatScheduledAt(item.scheduledAt)}</span></div>
+          <div className="upcoming-meta">{isOverdue ? <span className="draft-pill overdue-pill"><AlertCircle size={13} /> 予定時刻を過ぎています</span> : <span className="scheduled-pill"><Clock3 size={13} /> 予約済み</span>}{item.topicTag && <span className="draft-pill account-pill-small">#{item.topicTag}</span>}{showAccount && <span className="draft-pill account-pill-small">{item.accountUsername ? `@${item.accountUsername}` : 'アカウント不明'}</span>}<span>{formatScheduledAt(item.scheduledAt)}</span></div>
           <p>{item.text}</p>
         </div>
         <div className="scheduled-actions">
@@ -696,18 +729,23 @@ function App() {
             <>
               <section className="intro"><div><p className="eyebrow">{today}</p><h1>投稿を作成<span>。</span></h1><p className="subcopy">連携した{platformInfo.label}アカウントへ、そのまま投稿できます。</p></div>{editingDraftId && <button className="outline-button" onClick={startNewPost}><PenLine size={16} /> 新規作成</button>}</section>
               {!isConnected && connectionCard}
-            <section className="composer-grid"><div className="composer-card"><div className="composer-toolbar"><div className="account-pill"><span className="x-mini">{platformInfo.symbol}</span><span><b>{isConnected ? `@${username}` : `${platformInfo.label}アカウント`}</b><small>{platformInfo.label}へ投稿</small></span><ChevronDown size={14} /></div>{editingDraftId && <span className="draft-pill"><FileText size={13} /> 下書きを編集中</span>}<button className="more-button" aria-label="その他"><MoreHorizontal size={19} /></button></div><textarea value={post} onChange={(event) => setPost(event.target.value.slice(0, maxCharacters))} placeholder="世界に向けて発信しましょう…" />{images.length > 0 && (
+            <section className="composer-grid"><div className="composer-card"><div className="composer-toolbar"><div className="account-pill"><span className="x-mini">{platformInfo.symbol}</span><span><b>{isConnected ? `@${username}` : `${platformInfo.label}アカウント`}</b><small>{platformInfo.label}へ投稿</small></span><ChevronDown size={14} /></div>{editingDraftId && <span className="draft-pill"><FileText size={13} /> 下書きを編集中</span>}<button className="more-button" aria-label="その他"><MoreHorizontal size={19} /></button></div><textarea ref={textareaRef} value={post} onChange={(event) => setPost(event.target.value.slice(0, maxCharacters))} placeholder="世界に向けて発信しましょう…" />{platform === 'threads' && (
+                <div className="topic-tag-field">
+                  <label><Hash size={15} /><input ref={topicTagInputRef} value={topicTag} onChange={(event) => setTopicTag(event.target.value)} placeholder="トピックタグ(任意・1つ)" aria-label="トピックタグ" aria-invalid={Boolean(topicTagError)} /></label>
+                  {topicTagError ? <small className="topic-tag-error">{topicTagError}</small> : hasInlineTag ? <small>本文の「#〜」は本文にも残ります。本文に出したくないタグは、この欄に入力してください(タグは1投稿に1つ)。</small> : <small>ここに入れたタグは本文には表示されません。</small>}
+                </div>
+              )}{images.length > 0 && (
                 <ul className="attachment-grid" aria-label="添付画像">
                   {images.map((item) => <li key={item.id}><img src={item.url} alt={item.file.name} /><button type="button" onClick={() => removeImage(item.id)} aria-label={`${item.file.name} を削除`} title="画像を削除"><X size={14} /></button></li>)}
                 </ul>
-              )}<div className="composer-footer"><div className="format-actions"><input ref={imageInputRef} type="file" accept={imageTypes.join(',')} multiple hidden onChange={handleSelectImages} /><button type="button" aria-label="画像を追加" title={images.length >= maxImages ? `画像は${maxImages}枚までです` : `画像を追加(JPEG・PNG、5MBまで、${maxImages}枚まで)`} disabled={images.length >= maxImages} onClick={() => imageInputRef.current?.click()}><Image size={19} />{images.length > 0 && <span className="attachment-count">{images.length}</span>}</button><button type="button" aria-label="ファイルを添付" title="画像ファイルを添付" disabled={images.length >= maxImages} onClick={() => imageInputRef.current?.click()}><Paperclip size={19} /></button><button aria-label="ハッシュタグを追加"><Hash size={19} /></button><button aria-label="投稿を削除"><Trash2 size={18} /></button></div><div className="character-count"><span className={post.length > maxCharacters - 30 ? 'near-limit' : ''}>{post.length}</span> / {maxCharacters}<button className="schedule-button draft-save-button" disabled={!post.trim()} onClick={handleSaveDraft}><FileText size={16} /> 下書き保存</button><span className="schedule-wrap"><button className="schedule-button" disabled={!post.trim() || isOverLimit} aria-expanded={isScheduleOpen} onClick={() => isScheduleOpen ? setIsScheduleOpen(false) : openSchedule()}><Clock3 size={16} /> 予約投稿</button>{isScheduleOpen && (
+              )}<div className="composer-footer"><div className="format-actions"><input ref={imageInputRef} type="file" accept={imageTypes.join(',')} multiple hidden onChange={handleSelectImages} /><button type="button" aria-label="画像を追加" title={images.length >= maxImages ? `画像は${maxImages}枚までです` : `画像を追加(JPEG・PNG、5MBまで、${maxImages}枚まで)`} disabled={images.length >= maxImages} onClick={() => imageInputRef.current?.click()}><Image size={19} />{images.length > 0 && <span className="attachment-count">{images.length}</span>}</button><button type="button" aria-label="ファイルを添付" title="画像ファイルを添付" disabled={images.length >= maxImages} onClick={() => imageInputRef.current?.click()}><Paperclip size={19} /></button><button type="button" aria-label="ハッシュタグを追加" title={platform === 'threads' ? 'トピックタグを入力' : '本文に「#」を入れる'} onClick={handleHashButton}><Hash size={19} /></button><button aria-label="投稿を削除"><Trash2 size={18} /></button></div><div className="character-count"><span className={post.length > maxCharacters - 30 ? 'near-limit' : ''}>{post.length}</span> / {maxCharacters}<button className="schedule-button draft-save-button" disabled={!post.trim()} onClick={handleSaveDraft}><FileText size={16} /> 下書き保存</button><span className="schedule-wrap"><button className="schedule-button" disabled={!post.trim() || isOverLimit || Boolean(topicTagError)} aria-expanded={isScheduleOpen} onClick={() => isScheduleOpen ? setIsScheduleOpen(false) : openSchedule()}><Clock3 size={16} /> 予約投稿</button>{isScheduleOpen && (
                 <form className="schedule-popover" onSubmit={handleSchedule}>
                   <label htmlFor="schedule-at">投稿する日時</label>
                   <input id="schedule-at" type="datetime-local" value={scheduleAt} min={toLocalInputValue(new Date())} onChange={(event) => setScheduleAt(event.target.value)} required />
                   <p>予約はこのブラウザに保存されます。</p>
                   <div><button type="button" className="outline-button" onClick={() => setIsScheduleOpen(false)}>キャンセル</button><button type="submit" className="post-button" disabled={!scheduleAt}>予約する</button></div>
                 </form>
-              )}</span><button className="post-button" disabled={!isConnected || (!post.trim() && images.length === 0) || isOverLimit || isPosting} onClick={handlePost}><Send size={16} /> {isPosting ? '投稿中...' : '今すぐ投稿'}</button></div></div></div><aside className="preview-card"><div className="preview-label"><span>プレビュー</span><span className="live-dot">LIVE</span></div><div className="preview-post"><div className="preview-user"><span className="avatar peach">{initial}</span><div><b>{isConnected ? displayName : 'あなたのアカウント'}</b><span>@{isConnected ? username : 'username'} · 今</span></div><span className="preview-x">{platformInfo.symbol}</span></div><p>{post || (images.length ? '' : '入力した投稿内容がここに表示されます。')}</p>{images.length > 0 && <div className={`preview-images count-${images.length}`}>{images.map((item) => <img key={item.id} src={item.url} alt="" />)}</div>}<div className="preview-actions"><span>♡ 0</span><span>↻ 0</span><span>♧ 0</span><MoreHorizontal size={15} /></div></div><div className="preview-tip"><Sparkles size={15} /><span><b>印象に残る投稿に</b><br />短く、わかりやすく、あなたらしく。</span></div></aside></section>
+              )}</span><button className="post-button" disabled={!isConnected || (!post.trim() && images.length === 0) || isOverLimit || Boolean(topicTagError) || isPosting} onClick={handlePost}><Send size={16} /> {isPosting ? '投稿中...' : '今すぐ投稿'}</button></div></div></div><aside className="preview-card"><div className="preview-label"><span>プレビュー</span><span className="live-dot">LIVE</span></div><div className="preview-post"><div className="preview-user"><span className="avatar peach">{initial}</span><div><b>{isConnected ? displayName : 'あなたのアカウント'}</b><span>@{isConnected ? username : 'username'} · 今</span></div><span className="preview-x">{platformInfo.symbol}</span></div><p>{post || (images.length ? '' : '入力した投稿内容がここに表示されます。')}</p>{platform === 'threads' && cleanTopicTag && !topicTagError && <span className="preview-topic-tag"><Hash size={12} />{cleanTopicTag}</span>}{images.length > 0 && <div className={`preview-images count-${images.length}`}>{images.map((item) => <img key={item.id} src={item.url} alt="" />)}</div>}<div className="preview-actions"><span>♡ 0</span><span>↻ 0</span><span>♧ 0</span><MoreHorizontal size={15} /></div></div><div className="preview-tip"><Sparkles size={15} /><span><b>印象に残る投稿に</b><br />短く、わかりやすく、あなたらしく。</span></div></aside></section>
             </>
           )}
           {view === 'drafts' && (

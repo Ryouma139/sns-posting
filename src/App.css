@@ -1945,3 +1945,62 @@ button.profile[aria-expanded='true'] {
   color: var(--muted);
   font-size: 11px;
 }
+
+/* Threads のトピックタグ欄 */
+.topic-tag-field {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  margin: 0 0 14px;
+}
+
+.topic-tag-field label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1.5px solid var(--line);
+  border-radius: 999px;
+  color: var(--accent);
+}
+
+.topic-tag-field label:focus-within {
+  border-color: var(--accent);
+}
+
+.topic-tag-field input {
+  width: 200px;
+  max-width: 50vw;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.topic-tag-field input[aria-invalid='true'] {
+  color: var(--coral-dark);
+}
+
+.topic-tag-field small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.topic-tag-field .topic-tag-error {
+  color: var(--coral-dark);
+}
+
+.preview-topic-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin: -6px 0 12px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: #eef0ff;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+}

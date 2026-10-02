@@ -163,11 +163,20 @@ const imageTypes = ['image/jpeg', 'image/png']
 async function readPostBody(request) {
   if (!(request.headers.get('content-type') || '').includes('multipart/form-data')) {
     const body = await request.json().catch(() => null)
-    return { text: body?.text, accountId: body?.accountId, images: [] }
+    return { text: body?.text, accountId: body?.accountId, topicTag: body?.topicTag, images: [] }
   }
   const form = await request.formData().catch(() => null)
   if (!form) return null
-  return { text: form.get('text'), accountId: form.get('accountId') || '', images: form.getAll('images').filter((item) => typeof item !== 'string') }
+  return { text: form.get('text'), accountId: form.get('accountId') || '', topicTag: form.get('topicTag'), images: form.getAll('images').filter((item) => typeof item !== 'string') }
+}
+
+// Threads のトピックタグ(1投稿に1つ)。本文に「#」で書くと本文にも残るため、topic_tag で別に送る
+// 1〜50文字、ピリオドとアンパサンドは使えない。先頭の # は付けても外す
+function validateTopicTag(value) {
+  const tag = typeof value === 'string' ? value.trim().replace(/^#+/, '') : ''
+  if (!tag) return { tag: '' }
+  if (tag.length > 50 || /[.&]/.test(tag)) return { error: json({ error: 'タグは50文字以内で、「.」と「&」は使えません。' }, 400) }
+  return { tag }
 }
 
 // 本文と画像を確認し、問題があればエラーの Response を返す
@@ -415,6 +424,10 @@ async function threadsCreatePost(request, env, session) {
   if (mismatch) return mismatch
   const { text, error } = validatePost(body, 500)
   if (error) return error
+  const topic = validateTopicTag(body.topicTag)
+  if (topic.error) return topic.error
+  // 本文とタグは、カルーセルなら全体のコンテナにだけ付ける
+  const caption = { ...(text ? { text } : {}), ...(topic.tag ? { topic_tag: topic.tag } : {}) }
   const origin = new URL(request.url).origin
   // localhost の画像は Meta から取りに来られない
   if (body.images.length && /^https?:\/\/(localhost|127\.0\.0\.1)(:|$)/.test(origin)) return json({ error: 'Threadsへの画像付き投稿は本番環境でのみ使えます(Metaがlocalhostの画像を取得できないため)。' }, 400)
@@ -424,15 +437,15 @@ async function threadsCreatePost(request, env, session) {
     const imageUrls = await Promise.all(body.images.map(async (image) => `${origin}/api/media/${await storeMedia(env, image)}`))
     let container
     if (imageUrls.length === 0) {
-      container = await create({ media_type: 'TEXT', text })
+      container = await create({ media_type: 'TEXT', ...caption })
     } else if (imageUrls.length === 1) {
-      container = await create({ media_type: 'IMAGE', image_url: imageUrls[0], ...(text ? { text } : {}) })
+      container = await create({ media_type: 'IMAGE', image_url: imageUrls[0], ...caption })
       await waitForThreadsContainer(session, container.id, threads.accessToken)
     } else {
       const items = []
       for (const imageUrl of imageUrls) items.push(await create({ media_type: 'IMAGE', image_url: imageUrl, is_carousel_item: 'true' }))
       for (const item of items) await waitForThreadsContainer(session, item.id, threads.accessToken)
-      container = await create({ media_type: 'CAROUSEL', children: items.map((item) => item.id).join(','), ...(text ? { text } : {}) })
+      container = await create({ media_type: 'CAROUSEL', children: items.map((item) => item.id).join(','), ...caption })
       await waitForThreadsContainer(session, container.id, threads.accessToken)
     }
     const published = await threadsFetch(session, `/v1.0/me/threads_publish?creation_id=${container.id}`, threads.accessToken, { method: 'POST' })
