@@ -1775,3 +1775,82 @@ button.profile[aria-expanded='true'] {
 .scheduled-actions a.more-button {
   display: inline-flex;
 }
+
+.usage-tabs {
+  display: inline-flex;
+  gap: 4px;
+  margin-top: 32px;
+  padding: 4px;
+  border: 1.5px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.usage-tabs button {
+  padding: 8px 14px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.usage-tabs button.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.usage-tabs + .kpi-row,
+.usage-tabs + .usage-note + .kpi-row {
+  margin-top: 16px;
+}
+
+.usage-breakdown dd {
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-references {
+  display: grid;
+  margin: 16px 0 0;
+  padding: 0;
+  border: 1.5px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+  list-style: none;
+}
+
+.usage-references li + li {
+  border-top: 1px solid var(--line);
+}
+
+.usage-references a {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px 20px;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.usage-references a:hover b {
+  text-decoration: underline;
+}
+
+.usage-references span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.usage-references b {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.usage-references small {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 11px;
+}

@@ -170,10 +170,79 @@ async function xCreatePost(request, session) {
 // ---- Threads ----
 // X とは別に session.threads へ保存し、両方を同時に連携できるようにする
 
-async function threadsFetch(path, accessToken, options = {}) {
+// ---- Threads API の呼び出し回数 ----
+// このアプリから呼んだ回数を種類ごとに数え、リクエストの最後に KV へまとめて保存する(書き込みは1リクエスト1回)
+// KV のキー: threads-calls:{ユーザーID} = { hours: { 'YYYY-MM-DDTHH': { 種類: 回数 } }, appUsage }
+const callKeepHours = 48
+
+function callCategory(path, method = 'GET') {
+  if (path.includes('access_token')) return 'auth'
+  if (path.includes('/insights')) return 'insights'
+  if (path.includes('threads_insights') || path.includes('threads_publishing_limit')) return 'usage'
+  if (path.includes('keyword_search')) return 'search'
+  if (path.includes('threads_publish') || (method === 'POST' && path.includes('/threads'))) return 'publish'
+  if (path.includes('/threads')) return 'posts'
+  return 'profile'
+}
+
+function countThreadsCall(session, category, response) {
+  const calls = session.threadsCalls ||= { counts: {}, appUsage: null }
+  calls.counts[category] = (calls.counts[category] || 0) + 1
+  // 呼び出しが多くなると Meta が上限に対する使用率(%)を返す
+  const header = response?.headers.get('x-app-usage')
+  if (header) {
+    try {
+      calls.appUsage = { ...JSON.parse(header), at: new Date().toISOString() }
+    } catch {
+      // 形式が違えば無視する
+    }
+  }
+}
+
+const hourKey = (date) => date.toISOString().slice(0, 13)
+
+async function readThreadsCalls(env, userId) {
+  if (!userId) return { hours: {}, appUsage: null }
+  const stored = await env.SESSIONS.get(`threads-calls:${userId}`, 'json').catch(() => null)
+  return stored || { hours: {}, appUsage: null }
+}
+
+// 保存済みの回数に、このリクエストで呼んだ回数を足す(古い時間帯は捨てる)
+function mergeThreadsCalls(record, session) {
+  const calls = session.threadsCalls
+  if (!calls) return record
+  const hours = { ...record.hours }
+  const now = hourKey(new Date())
+  hours[now] = { ...hours[now] }
+  for (const [category, count] of Object.entries(calls.counts)) hours[now][category] = (hours[now][category] || 0) + count
+  const oldest = hourKey(new Date(Date.now() - callKeepHours * 3600 * 1000))
+  for (const key of Object.keys(hours)) if (key < oldest) delete hours[key]
+  return { hours, appUsage: calls.appUsage || record.appUsage }
+}
+
+async function saveThreadsCalls(session, env) {
+  const userId = session.data.threads?.userId
+  if (!session.threadsCalls || !userId) return
+  const record = mergeThreadsCalls(await readThreadsCalls(env, userId), session)
+  await env.SESSIONS.put(`threads-calls:${userId}`, JSON.stringify(record), { expirationTtl: 3 * 86400 })
+}
+
+// 直近24時間の合計と種類ごとの内訳
+function summarizeThreadsCalls(record) {
+  const since = hourKey(new Date(Date.now() - 23 * 3600 * 1000))
+  const byCategory = {}
+  for (const [key, counts] of Object.entries(record.hours)) {
+    if (key < since) continue
+    for (const [category, count] of Object.entries(counts)) byCategory[category] = (byCategory[category] || 0) + count
+  }
+  return { total: Object.values(byCategory).reduce((sum, count) => sum + count, 0), byCategory }
+}
+
+async function threadsFetch(session, path, accessToken, options = {}) {
   const url = new URL(path, threadsGraph)
   url.searchParams.set('access_token', accessToken)
   const threadsResponse = await fetch(url, options)
+  countThreadsCall(session, callCategory(path, options.method), threadsResponse)
   const result = await threadsResponse.json()
   if (!threadsResponse.ok) {
     const error = new Error(result.error?.message || 'Threads APIの呼び出しに失敗しました。')
@@ -201,12 +270,13 @@ async function threadsCallback(request, env, session, url) {
   if (url.searchParams.get('error') || !code || !oauth) return clearOAuth(redirect('/?threads_error=oauth'))
   try {
     const tokenResponse = await fetch(`${threadsGraph}/oauth/access_token`, { method: 'POST', body: new URLSearchParams({ client_id: env.THREADS_APP_ID, client_secret: env.THREADS_APP_SECRET, grant_type: 'authorization_code', redirect_uri: redirectUri(env, request, 'THREADS_REDIRECT_URI', 'threads'), code }) })
+    countThreadsCall(session, 'auth', tokenResponse)
     const token = await tokenResponse.json()
     if (!tokenResponse.ok) throw new Error(token.error?.message || 'Threads token exchange failed')
     // 短期トークン(約1時間)を長期トークン(約60日)に交換する
-    const longLived = await threadsFetch(`/access_token?grant_type=th_exchange_token&client_secret=${encodeURIComponent(env.THREADS_APP_SECRET)}`, token.access_token)
+    const longLived = await threadsFetch(session, `/access_token?grant_type=th_exchange_token&client_secret=${encodeURIComponent(env.THREADS_APP_SECRET)}`, token.access_token)
     const accessToken = longLived.access_token || token.access_token
-    const user = await threadsFetch('/v1.0/me?fields=id,username,name,threads_profile_picture_url,threads_biography', accessToken)
+    const user = await threadsFetch(session, '/v1.0/me?fields=id,username,name,threads_profile_picture_url,threads_biography', accessToken)
     session.data.threads = {
       accessToken,
       userId: user.id,
@@ -223,9 +293,9 @@ async function threadsCallback(request, env, session, url) {
 }
 
 // 投稿ごとの反応(いいね等)。insightsの権限がない場合は null を返して一覧だけ表示する
-async function loadThreadsMetrics(postId, accessToken) {
+async function loadThreadsMetrics(session, postId, accessToken) {
   try {
-    const insights = await threadsFetch(`/v1.0/${postId}/insights?metric=likes,replies,reposts,quotes,views`, accessToken)
+    const insights = await threadsFetch(session, `/v1.0/${postId}/insights?metric=likes,replies,reposts,quotes,views`, accessToken)
     const value = (name) => {
       const metric = insights.data?.find((item) => item.name === name)
       return metric?.values?.[0]?.value ?? metric?.total_value?.value ?? 0
@@ -241,13 +311,13 @@ async function threadsGetPosts(session) {
   const threads = session.data.threads
   if (!threads?.accessToken) return json({ error: 'Threadsアカウントが連携されていません。' }, 401)
   try {
-    const result = await threadsFetch('/v1.0/me/threads?fields=id,media_type,text,timestamp,permalink&limit=20', threads.accessToken)
+    const result = await threadsFetch(session, '/v1.0/me/threads?fields=id,media_type,text,timestamp,permalink&limit=20', threads.accessToken)
     const posts = await Promise.all((result.data || []).map(async (item) => ({
       id: item.id,
       text: item.text || '',
       created_at: item.timestamp,
       permalink: item.permalink,
-      public_metrics: await loadThreadsMetrics(item.id, threads.accessToken),
+      public_metrics: await loadThreadsMetrics(session, item.id, threads.accessToken),
     })))
     return json({ posts })
   } catch (postsError) {
@@ -265,8 +335,8 @@ async function threadsCreatePost(request, session) {
   if (!text || text.length > 500) return json({ error: '投稿本文は1文字以上500文字以内で入力してください。' }, 400)
   try {
     // Threadsは「コンテナ作成」→「公開」の2段階で投稿する
-    const container = await threadsFetch(`/v1.0/me/threads?${new URLSearchParams({ media_type: 'TEXT', text })}`, threads.accessToken, { method: 'POST' })
-    const published = await threadsFetch(`/v1.0/me/threads_publish?creation_id=${container.id}`, threads.accessToken, { method: 'POST' })
+    const container = await threadsFetch(session, `/v1.0/me/threads?${new URLSearchParams({ media_type: 'TEXT', text })}`, threads.accessToken, { method: 'POST' })
+    const published = await threadsFetch(session, `/v1.0/me/threads_publish?creation_id=${container.id}`, threads.accessToken, { method: 'POST' })
     return json({ id: published.id, text })
   } catch (publishError) {
     return threadsError(publishError, 'Threadsへの投稿に失敗しました。')
@@ -289,7 +359,7 @@ async function threadsSearch(session, url) {
   const period = searchPeriods[url.searchParams.get('period')]
   if (period) params.set('since', String(Math.floor(Date.now() / 1000) - period))
   try {
-    const result = await threadsFetch(`/v1.0/keyword_search?${params}`, threads.accessToken)
+    const result = await threadsFetch(session, `/v1.0/keyword_search?${params}`, threads.accessToken)
     const posts = (result.data || []).map((item) => ({ id: item.id, text: item.text || '', username: item.username || '', permalink: item.permalink || '', created_at: item.timestamp, mediaType: item.media_type || '' }))
     return json({ posts })
   } catch (searchError) {
@@ -298,23 +368,38 @@ async function threadsSearch(session, url) {
 }
 
 // 投稿・返信の上限と、直近24時間の消費数(Threads の threads_publishing_limit)
-async function threadsGetUsage(session) {
+async function threadsGetUsage(session, env) {
   const threads = session.data.threads
   if (!threads?.accessToken) return json({ error: 'Threadsアカウントが連携されていません。' }, 401)
   const path = (fields) => `/v1.0/${threads.userId || 'me'}/threads_publishing_limit?fields=${fields}`
   try {
     let result
     try {
-      result = await threadsFetch(path('quota_usage,config,reply_quota_usage,reply_config'), threads.accessToken)
+      result = await threadsFetch(session, path('quota_usage,config,reply_quota_usage,reply_config'), threads.accessToken)
     } catch {
       // 返信の項目が取れない場合は、投稿の項目だけで取り直す
-      result = await threadsFetch(path('quota_usage,config'), threads.accessToken)
+      result = await threadsFetch(session, path('quota_usage,config'), threads.accessToken)
     }
     const limit = result.data?.[0] || {}
     const quota = (usage, config) => (config ? { used: usage ?? 0, total: config.quota_total ?? null, durationSeconds: config.quota_duration ?? null } : null)
+    // API呼び出しの上限 = 4,800 × 直近24時間の表示回数(10未満は10として計算)
+    let callLimit = null
+    try {
+      const now = Math.floor(Date.now() / 1000)
+      const views = await threadsFetch(session, `/v1.0/${threads.userId || 'me'}/threads_insights?metric=views&since=${now - 86400}&until=${now}`, threads.accessToken)
+      const metric = views.data?.[0]
+      const impressions = metric?.total_value?.value ?? (metric?.values || []).reduce((sum, item) => sum + (item.value || 0), 0)
+      callLimit = { impressions, total: 4800 * Math.max(impressions, 10) }
+    } catch {
+      // 表示回数が取れなければ上限は出さない
+    }
+    const record = mergeThreadsCalls(await readThreadsCalls(env, threads.userId), session)
     return json({
       posts: quota(limit.quota_usage, limit.config),
       replies: quota(limit.reply_quota_usage, limit.reply_config),
+      calls: summarizeThreadsCalls(record),
+      callLimit,
+      appUsage: record.appUsage,
       checkedAt: new Date().toISOString(),
     })
   } catch (usageError) {
@@ -346,7 +431,7 @@ async function route(request, env, session, url) {
       session.dirty = true
       return json({ connected: false })
     case 'GET /api/threads/posts': return threadsGetPosts(session)
-    case 'GET /api/threads/usage': return threadsGetUsage(session)
+    case 'GET /api/threads/usage': return threadsGetUsage(session, env)
     case 'GET /api/threads/search': return threadsSearch(session, url)
     case 'POST /api/threads/posts': return threadsCreatePost(request, session)
     default: return json({ error: 'Not Found' }, 404)
@@ -358,6 +443,8 @@ export default {
     const url = new URL(request.url)
     if (!url.pathname.startsWith('/api/')) return env.ASSETS.fetch(request)
     const session = await loadSession(request, env)
-    return finish(session, env, await route(request, env, session, url))
+    const response = await route(request, env, session, url)
+    await saveThreadsCalls(session, env).catch((saveError) => console.error(saveError))
+    return finish(session, env, response)
   },
 }

@@ -83,6 +83,16 @@ function formatDuration(seconds) {
   return seconds % 3600 === 0 ? `${seconds / 3600}時間` : `${Math.round(seconds / 60)}分`
 }
 
+// API利用状況の「API呼び出し」タブで表示する種類
+// API利用状況の画面に出す参照URL(上限や計算式の出典)
+const usageReferences = [
+  { label: 'Threads API の概要(レート制限・投稿/返信/削除の上限)', url: 'https://developers.facebook.com/documentation/threads/overview' },
+  { label: 'Threads の投稿(threads_publishing_limit)', url: 'https://developers.facebook.com/docs/threads/posts/' },
+  { label: 'Graph API のレート制限(X-App-Usage ヘッダー)', url: 'https://developers.facebook.com/docs/graph-api/overview/rate-limiting/' },
+]
+
+const callCategoryLabels = { posts: '投稿一覧', insights: 'インサイト(いいね数など)', publish: '投稿', search: 'トレンド検索', usage: '利用状況の確認', profile: 'プロフィール', auth: '連携(トークン)' }
+
 function formatScheduledAt(value) {
   return new Date(value).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', weekday: 'short', hour: '2-digit', minute: '2-digit' })
 }
@@ -325,6 +335,8 @@ function App() {
   const [usage, setUsage] = useState(null)
   const [usageError, setUsageError] = useState('')
   const [isUsageLoading, setIsUsageLoading] = useState(false)
+  // quota = 投稿・返信の上限、calls = API呼び出しの合計
+  const [usageTab, setUsageTab] = useState('quota')
   const loadUsage = async () => {
     setIsUsageLoading(true)
     setUsageError('')
@@ -706,7 +718,11 @@ function App() {
               ) : !isConnected ? connectionCard : (
                 <>
                   {usageError && <p className="archive-empty usage-note">{usageError}</p>}
-                  {usage && (
+                  <div className="usage-tabs" role="tablist" aria-label="表示の切り替え">
+                    <button type="button" role="tab" aria-selected={usageTab === 'quota'} className={usageTab === 'quota' ? 'active' : undefined} onClick={() => setUsageTab('quota')}>投稿・返信の上限</button>
+                    <button type="button" role="tab" aria-selected={usageTab === 'calls'} className={usageTab === 'calls' ? 'active' : undefined} onClick={() => setUsageTab('calls')}>API呼び出しの合計</button>
+                  </div>
+                  {usage && usageTab === 'quota' && (
                     <section className="kpi-row" aria-label="Threads API の消費状況">
                       {[['投稿', Send, usage.posts], ['返信', MessageCircle, usage.replies]].filter(([, , quota]) => quota).map(([label, Icon, quota]) => {
                         const ratio = quota.total ? Math.min(quota.used / quota.total, 1) : 0
@@ -721,6 +737,38 @@ function App() {
                       })}
                     </section>
                   )}
+                  {usage && usageTab === 'calls' && (() => {
+                    const used = usage.calls?.total ?? 0
+                    const total = usage.callLimit?.total
+                    const ratio = total ? Math.min(used / total, 1) : 0
+                    const appUsage = usage.appUsage
+                    return (
+                      <>
+                        <section className="kpi-row" aria-label="API呼び出しの消費状況">
+                          <div className="kpi-tile">
+                            <span><Gauge size={13} /> このアプリの呼び出し</span>
+                            <b>{used.toLocaleString('ja-JP')}<small className="usage-total"> / {total ? total.toLocaleString('ja-JP') : '-'}</small></b>
+                            <div className={`usage-meter${ratio >= 0.8 ? ' high' : ''}`} role="meter" aria-valuemin={0} aria-valuemax={total || 0} aria-valuenow={used} aria-label="API呼び出しの消費"><i style={{ width: `${ratio * 100}%` }} /></div>
+                            <small>直近24時間 · 上限は 4,800 × 表示回数</small>
+                          </div>
+                          <div className="kpi-tile">
+                            <span>表示回数(直近24時間)</span>
+                            <b>{usage.callLimit ? usage.callLimit.impressions.toLocaleString('ja-JP') : '-'}</b>
+                            <small>{usage.callLimit ? '10未満は10として計算' : '取得できませんでした'}</small>
+                          </div>
+                          <div className="kpi-tile">
+                            <span>Meta の使用率</span>
+                            <b>{appUsage ? `${Math.max(appUsage.call_count || 0, appUsage.total_cputime || 0, appUsage.total_time || 0)}%` : '余裕あり'}</b>
+                            <small>{appUsage ? `呼び出し${appUsage.call_count ?? 0}% · CPU${appUsage.total_cputime ?? 0}% · 処理時間${appUsage.total_time ?? 0}%` : 'X-App-Usage は呼び出しが多くなると返る'}</small>
+                          </div>
+                        </section>
+                        <dl className="usage-limits usage-breakdown">
+                          {Object.entries(callCategoryLabels).map(([key, label]) => <div key={key}><dt>{label}</dt><dd>{(usage.calls?.byCategory?.[key] || 0).toLocaleString('ja-JP')}回</dd></div>)}
+                        </dl>
+                        <p className="archive-note trend-note">このアプリから呼んだ回数だけを数えています(1時間単位で記録)。同じアカウントで別のアプリから呼んだ分は含まれません。</p>
+                      </>
+                    )
+                  })()}
                   <div className="archive-footer"><span className="archive-note">{usage ? `${new Date(usage.checkedAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })} に取得 · ` : ''}時刻ごとに区切らず、直近24時間の件数で数えます</span><button className="outline-button" disabled={isUsageLoading} onClick={loadUsage}>{isUsageLoading ? '読み込み中...' : '最新に更新'}</button></div>
                   <section className="archive-section">
                     <div className="section-heading compact"><div><p className="eyebrow">Meta の仕様とこのアプリ</p><h2>主な上限</h2></div></div>
@@ -732,6 +780,12 @@ function App() {
                       <div><dt>このアプリの呼び出し数</dt><dd>投稿1回で2回(作成と公開)。投稿アーカイブの読み込みで「1 + 投稿数」回(最大{archiveLimit + 1}回)。この画面の表示で1回。</dd></div>
                       <div><dt>Cloudflare Workers</dt><dd>無料プランでは1リクエストあたり外部への呼び出しが50回まで。アーカイブの取得件数を増やすときに注意します。</dd></div>
                     </dl>
+                  </section>
+                  <section className="archive-section">
+                    <div className="section-heading compact"><div><p className="eyebrow">Meta for Developers</p><h2>参照URL</h2></div></div>
+                    <ul className="usage-references">
+                      {usageReferences.map((item) => <li key={item.url}><a href={item.url} target="_blank" rel="noreferrer"><ExternalLink size={14} /><span><b>{item.label}</b><small>{item.url}</small></span></a></li>)}
+                    </ul>
                   </section>
                 </>
               )}
