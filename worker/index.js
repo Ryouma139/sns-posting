@@ -86,8 +86,8 @@ async function xConnect(request, env) {
   const state = randomHex(24)
   const codeVerifier = base64url(crypto.getRandomValues(new Uint8Array(32)))
   const codeChallenge = base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier))))
-  const params = new URLSearchParams({ response_type: 'code', client_id: env.X_CLIENT_ID, redirect_uri: redirectUri(env, request, 'X_REDIRECT_URI', 'x'), scope: 'tweet.read tweet.write users.read offline.access', state, code_challenge: codeChallenge, code_challenge_method: 'S256' })
-  return startOAuth(`https://twitter.com/i/oauth2/authorize?${params}`, { provider: 'x', state, codeVerifier })
+  const params = new URLSearchParams({ response_type: 'code', client_id: env.X_CLIENT_ID, redirect_uri: redirectUri(env, request, 'X_REDIRECT_URI', 'x'), scope: 'tweet.read tweet.write users.read media.write offline.access', state, code_challenge: codeChallenge, code_challenge_method: 'S256' })
+  return startOAuth(`https://x.com/i/oauth2/authorize?${params}`, { provider: 'x', state, codeVerifier })
 }
 
 async function xCallback(request, env, session, url) {
@@ -154,17 +154,69 @@ function accountMismatch(body, data) {
   return json({ error: '予約したアカウントと、連携中のアカウントが違います。' }, 409)
 }
 
+// ---- 添付画像 ----
+// 画像付きの投稿は multipart/form-data(text, accountId, images)、テキストだけなら JSON で受け取る
+const maxImages = 4
+const maxImageBytes = 5 * 1024 * 1024
+const imageTypes = ['image/jpeg', 'image/png']
+
+async function readPostBody(request) {
+  if (!(request.headers.get('content-type') || '').includes('multipart/form-data')) {
+    const body = await request.json().catch(() => null)
+    return { text: body?.text, accountId: body?.accountId, images: [] }
+  }
+  const form = await request.formData().catch(() => null)
+  if (!form) return null
+  return { text: form.get('text'), accountId: form.get('accountId') || '', images: form.getAll('images').filter((item) => typeof item !== 'string') }
+}
+
+// 本文と画像を確認し、問題があればエラーの Response を返す
+function validatePost(body, maxLength) {
+  const text = typeof body.text === 'string' ? body.text.trim() : ''
+  if (text.length > maxLength) return { error: json({ error: `投稿本文は${maxLength}文字以内で入力してください。` }, 400) }
+  if (!text && body.images.length === 0) return { error: json({ error: '投稿本文か画像を入力してください。' }, 400) }
+  if (body.images.length > maxImages) return { error: json({ error: `画像は${maxImages}枚までです。` }, 400) }
+  if (body.images.some((image) => !imageTypes.includes(image.type))) return { error: json({ error: '画像は JPEG か PNG にしてください。' }, 400) }
+  if (body.images.some((image) => image.size > maxImageBytes)) return { error: json({ error: '画像は1枚5MBまでです。' }, 400) }
+  return { text }
+}
+
+async function xUploadImage(image, accessToken) {
+  const form = new FormData()
+  form.append('media', image, image.name || 'image')
+  form.append('media_category', 'tweet_image')
+  const uploadResponse = await fetch('https://api.x.com/2/media/upload', { method: 'POST', headers: { Authorization: `Bearer ${accessToken}` }, body: form })
+  const result = await uploadResponse.json().catch(() => ({}))
+  if (!uploadResponse.ok || !result.data?.id) {
+    // media.write を追加する前に連携したトークンでは 403 になる
+    const hint = uploadResponse.status === 403 ? '(画像の投稿には連携し直しが必要です)' : ''
+    const error = new Error(`${result.detail || result.title || '画像のアップロードに失敗しました。'}${hint}`)
+    error.status = uploadResponse.status
+    throw error
+  }
+  return result.data.id
+}
+
 async function xCreatePost(request, session) {
   if (!session.data.accessToken) return json({ error: 'Xアカウントが連携されていません。' }, 401)
-  const body = await request.json().catch(() => null)
+  const body = await readPostBody(request)
+  if (!body) return json({ error: '投稿内容を読み取れませんでした。' }, 400)
   const mismatch = accountMismatch(body, session.data)
   if (mismatch) return mismatch
-  const text = typeof body?.text === 'string' ? body.text.trim() : ''
-  if (!text || text.length > 280) return json({ error: '投稿本文は1文字以上280文字以内で入力してください。' }, 400)
-  const xResponse = await fetch('https://api.x.com/2/tweets', { method: 'POST', headers: { Authorization: `Bearer ${session.data.accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) })
+  const { text, error } = validatePost(body, 280)
+  if (error) return error
+  const tweet = text ? { text } : {}
+  try {
+    // 画像は先にアップロードし、返ってきた media_id を投稿に付ける(アップロードもクレジットを消費する)
+    if (body.images.length) tweet.media = { media_ids: await Promise.all(body.images.map((image) => xUploadImage(image, session.data.accessToken))) }
+  } catch (uploadError) {
+    console.error(uploadError)
+    return json({ error: uploadError.message }, uploadError.status || 500)
+  }
+  const xResponse = await fetch('https://api.x.com/2/tweets', { method: 'POST', headers: { Authorization: `Bearer ${session.data.accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify(tweet) })
   const result = await xResponse.json()
   if (!xResponse.ok) return json({ error: result.detail || result.title || 'Xへの投稿に失敗しました。' }, xResponse.status)
-  return json({ id: result.data.id, text: result.data.text })
+  return json({ id: result.data.id, text: result.data.text || text })
 }
 
 // ---- Threads ----
@@ -178,6 +230,7 @@ const callKeepHours = 48
 function callCategory(path, method = 'GET') {
   if (path.includes('access_token')) return 'auth'
   if (path.includes('/insights')) return 'insights'
+  if (path.includes('fields=status')) return 'publish'
   if (path.includes('threads_insights') || path.includes('threads_publishing_limit')) return 'usage'
   if (path.includes('keyword_search')) return 'search'
   if (path.includes('threads_publish') || (method === 'POST' && path.includes('/threads'))) return 'publish'
@@ -325,17 +378,63 @@ async function threadsGetPosts(session) {
   }
 }
 
-async function threadsCreatePost(request, session) {
+// Threads は画像を URL で受け取り、Meta のサーバーが取りに来る。
+// そのため画像を KV に一時保存し、/api/media/{ID} で公開する(Cloudflare Access の Bypass が必要)
+const mediaTtl = 3600
+
+async function storeMedia(env, image) {
+  const id = randomHex(16)
+  await env.SESSIONS.put(`media:${id}`, await image.arrayBuffer(), { expirationTtl: mediaTtl, metadata: { type: image.type } })
+  return id
+}
+
+async function serveMedia(env, id) {
+  if (!/^[0-9a-f]{32}$/.test(id)) return new Response('Not Found', { status: 404 })
+  const { value, metadata } = await env.SESSIONS.getWithMetadata(`media:${id}`, 'arrayBuffer')
+  if (!value) return new Response('Not Found', { status: 404 })
+  return new Response(value, { headers: { 'Content-Type': metadata?.type || 'application/octet-stream', 'Cache-Control': 'private, max-age=3600' } })
+}
+
+// 画像のコンテナは Meta が画像を取り込むまで公開できないため、FINISHED になるまで待つ
+async function waitForThreadsContainer(session, id, accessToken) {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const container = await threadsFetch(session, `/v1.0/${id}?fields=status,error_message`, accessToken)
+    if (container.status === 'FINISHED' || container.status === 'PUBLISHED') return
+    if (container.status === 'ERROR' || container.status === 'EXPIRED') throw new Error(`Threadsが画像を処理できませんでした。${container.error_message || ''}`)
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+  }
+  throw new Error('Threadsの画像の処理が時間内に終わりませんでした。')
+}
+
+async function threadsCreatePost(request, env, session) {
   const threads = session.data.threads
   if (!threads?.accessToken) return json({ error: 'Threadsアカウントが連携されていません。' }, 401)
-  const body = await request.json().catch(() => null)
+  const body = await readPostBody(request)
+  if (!body) return json({ error: '投稿内容を読み取れませんでした。' }, 400)
   const mismatch = accountMismatch(body, threads)
   if (mismatch) return mismatch
-  const text = typeof body?.text === 'string' ? body.text.trim() : ''
-  if (!text || text.length > 500) return json({ error: '投稿本文は1文字以上500文字以内で入力してください。' }, 400)
+  const { text, error } = validatePost(body, 500)
+  if (error) return error
+  const origin = new URL(request.url).origin
+  // localhost の画像は Meta から取りに来られない
+  if (body.images.length && /^https?:\/\/(localhost|127\.0\.0\.1)(:|$)/.test(origin)) return json({ error: 'Threadsへの画像付き投稿は本番環境でのみ使えます(Metaがlocalhostの画像を取得できないため)。' }, 400)
   try {
-    // Threadsは「コンテナ作成」→「公開」の2段階で投稿する
-    const container = await threadsFetch(session, `/v1.0/me/threads?${new URLSearchParams({ media_type: 'TEXT', text })}`, threads.accessToken, { method: 'POST' })
+    // Threadsは「コンテナ作成」→「公開」の2段階で投稿する。画像が2枚以上ならカルーセルにする
+    const create = (params) => threadsFetch(session, `/v1.0/me/threads?${new URLSearchParams(params)}`, threads.accessToken, { method: 'POST' })
+    const imageUrls = await Promise.all(body.images.map(async (image) => `${origin}/api/media/${await storeMedia(env, image)}`))
+    let container
+    if (imageUrls.length === 0) {
+      container = await create({ media_type: 'TEXT', text })
+    } else if (imageUrls.length === 1) {
+      container = await create({ media_type: 'IMAGE', image_url: imageUrls[0], ...(text ? { text } : {}) })
+      await waitForThreadsContainer(session, container.id, threads.accessToken)
+    } else {
+      const items = []
+      for (const imageUrl of imageUrls) items.push(await create({ media_type: 'IMAGE', image_url: imageUrl, is_carousel_item: 'true' }))
+      for (const item of items) await waitForThreadsContainer(session, item.id, threads.accessToken)
+      container = await create({ media_type: 'CAROUSEL', children: items.map((item) => item.id).join(','), ...(text ? { text } : {}) })
+      await waitForThreadsContainer(session, container.id, threads.accessToken)
+    }
     const published = await threadsFetch(session, `/v1.0/me/threads_publish?creation_id=${container.id}`, threads.accessToken, { method: 'POST' })
     return json({ id: published.id, text })
   } catch (publishError) {
@@ -433,7 +532,7 @@ async function route(request, env, session, url) {
     case 'GET /api/threads/posts': return threadsGetPosts(session)
     case 'GET /api/threads/usage': return threadsGetUsage(session, env)
     case 'GET /api/threads/search': return threadsSearch(session, url)
-    case 'POST /api/threads/posts': return threadsCreatePost(request, session)
+    case 'POST /api/threads/posts': return threadsCreatePost(request, env, session)
     default: return json({ error: 'Not Found' }, 404)
   }
 }
@@ -442,6 +541,8 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url)
     if (!url.pathname.startsWith('/api/')) return env.ASSETS.fetch(request)
+    // 画像は Meta のサーバーが取りに来るため、セッションを作らずに返す(KV への書き込みを増やさない)
+    if (request.method === 'GET' && url.pathname.startsWith('/api/media/')) return serveMedia(env, url.pathname.slice('/api/media/'.length))
     const session = await loadSession(request, env)
     const response = await route(request, env, session, url)
     await saveThreadsCalls(session, env).catch((saveError) => console.error(saveError))

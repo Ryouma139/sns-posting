@@ -97,6 +97,11 @@ function formatScheduledAt(value) {
   return new Date(value).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', weekday: 'short', hour: '2-digit', minute: '2-digit' })
 }
 
+// 添付画像(X と Threads の両方で使える範囲にそろえる。Worker 側の maxImages などと同じ値)
+const maxImages = 4
+const maxImageBytes = 5 * 1024 * 1024
+const imageTypes = ['image/jpeg', 'image/png']
+
 const notificationStorageKey = 'sns-posting-notifications'
 const notificationLimit = 50
 const notificationIcons = { success: Check, error: AlertCircle, info: Info }
@@ -110,6 +115,9 @@ function App() {
   const [route, setRoute] = useState(() => window.location.hash.slice(1))
   const view = getViewFromHash(route)
   const [post, setPost] = useState('')
+  // 添付画像 { id, file, url }。url はプレビュー用の blob URL。下書き・予約には保存しない
+  const [images, setImages] = useState([])
+  const imageInputRef = useRef(null)
   const [platform, setPlatform] = useState(loadStoredPlatform)
   const [accounts, setAccounts] = useState({ x: emptyAccount, threads: emptyAccount })
   const [archives, setArchives] = useState({ x: emptyArchive, threads: emptyArchive })
@@ -359,14 +367,23 @@ function App() {
   }, [view, platform, usageConnected])
 
   // accountId を渡すと、Worker 側でも連携中のアカウントと一致するか確認する
-  const publishPost = async (text, target = platform, accountId = '') => {
+  // attachments: 添付画像の File。画像があるときだけ multipart/form-data で送る
+  const publishPost = async (text, target = platform, accountId = '', attachments = []) => {
     const label = platforms[target].label
-    if (!text.trim() || !accounts[target].connected || isPosting) return false
+    if ((!text.trim() && attachments.length === 0) || !accounts[target].connected || isPosting) return false
     setIsPosting(true)
     let response
     let result
     try {
-      response = await fetch(`/api/${target}/posts`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, accountId }) })
+      let request = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, accountId }) }
+      if (attachments.length) {
+        const form = new FormData()
+        form.append('text', text)
+        form.append('accountId', accountId)
+        for (const file of attachments) form.append('images', file)
+        request = { method: 'POST', body: form }
+      }
+      response = await fetch(`/api/${target}/posts`, request)
       result = await response.json()
     } catch {
       showError(`${label}への投稿に失敗しました。APIサーバーの状態を確認してください。`)
@@ -380,7 +397,7 @@ function App() {
       addNotification('error', `${label}への投稿に失敗しました`, result.error || `エラー ${response.status}`)
       return false
     }
-    addNotification('success', `${label}へ投稿しました`, result.text)
+    addNotification('success', `${label}へ投稿しました`, [result.text, attachments.length ? `画像${attachments.length}枚` : ''].filter(Boolean).join(' · '))
     setIsNoticeError(false)
     setNotice(`${label}へ投稿しました`)
     updateArchive(target, (current) => ({ posts: [{ id: result.id, text: result.text, created_at: new Date().toISOString() }, ...current.posts].slice(0, archiveLimit) }))
@@ -389,11 +406,41 @@ function App() {
   }
 
   const handlePost = async () => {
-    if (await publishPost(post)) {
+    if (await publishPost(post, platform, '', images.map((item) => item.file))) {
       setPost('')
+      clearImages()
       finishEditingDraft()
     }
   }
+
+  const handleSelectImages = (event) => {
+    const files = [...event.target.files]
+    // 同じファイルを続けて選べるように、選択をリセットする
+    event.target.value = ''
+    const accepted = []
+    const rejected = []
+    for (const file of files) {
+      if (!imageTypes.includes(file.type)) rejected.push(`${file.name}(JPEG・PNG以外)`)
+      else if (file.size > maxImageBytes) rejected.push(`${file.name}(5MB超)`)
+      else if (images.length + accepted.length >= maxImages) rejected.push(`${file.name}(${maxImages}枚まで)`)
+      else accepted.push({ id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, file, url: URL.createObjectURL(file) })
+    }
+    if (accepted.length) setImages((current) => [...current, ...accepted])
+    if (rejected.length) showError(`添付できない画像があります: ${rejected.join('、')}`)
+  }
+
+  const removeImage = (id) => setImages((current) => current.filter((item) => {
+    if (item.id === id) URL.revokeObjectURL(item.url)
+    return item.id !== id
+  }))
+
+  const clearImages = () => setImages((current) => {
+    for (const item of current) URL.revokeObjectURL(item.url)
+    return []
+  })
+
+  // 画像はブラウザに保存できない大きさのため、下書き・予約には本文だけを残す
+  const imageNotSavedNote = images.length ? '(画像は保存されません)' : ''
 
   // 投稿・予約した下書きは一覧から消す
   const finishEditingDraft = () => {
@@ -431,7 +478,7 @@ function App() {
       setEditingDraftId(item.id)
     }
     setIsNoticeError(false)
-    setNotice('下書きを保存しました')
+    setNotice(`下書きを保存しました${imageNotSavedNote}`)
     window.setTimeout(() => setNotice(''), 3000)
   }
 
@@ -468,6 +515,7 @@ function App() {
 
   const startNewPost = () => {
     setPost('')
+    clearImages()
     setEditingDraftId(null)
     setIsScheduleOpen(false)
   }
@@ -491,9 +539,10 @@ function App() {
     setScheduledPosts((current) => [...current, item])
     setIsScheduleOpen(false)
     setPost('')
+    clearImages()
     finishEditingDraft()
     setIsNoticeError(false)
-    setNotice(`${formatScheduledAt(item.scheduledAt)} に予約しました`)
+    setNotice(`${formatScheduledAt(item.scheduledAt)} に予約しました${imageNotSavedNote}`)
     addNotification('info', `${platformInfo.label}の予約投稿を追加しました`, `${formatScheduledAt(item.scheduledAt)} · ${item.text}`)
     window.setTimeout(() => setNotice(''), 3000)
   }
@@ -647,14 +696,18 @@ function App() {
             <>
               <section className="intro"><div><p className="eyebrow">{today}</p><h1>投稿を作成<span>。</span></h1><p className="subcopy">連携した{platformInfo.label}アカウントへ、そのまま投稿できます。</p></div>{editingDraftId && <button className="outline-button" onClick={startNewPost}><PenLine size={16} /> 新規作成</button>}</section>
               {!isConnected && connectionCard}
-            <section className="composer-grid"><div className="composer-card"><div className="composer-toolbar"><div className="account-pill"><span className="x-mini">{platformInfo.symbol}</span><span><b>{isConnected ? `@${username}` : `${platformInfo.label}アカウント`}</b><small>{platformInfo.label}へ投稿</small></span><ChevronDown size={14} /></div>{editingDraftId && <span className="draft-pill"><FileText size={13} /> 下書きを編集中</span>}<button className="more-button" aria-label="その他"><MoreHorizontal size={19} /></button></div><textarea value={post} onChange={(event) => setPost(event.target.value.slice(0, maxCharacters))} placeholder="世界に向けて発信しましょう…" /><div className="composer-footer"><div className="format-actions"><button aria-label="画像を追加"><Image size={19} /></button><button aria-label="ファイルを添付"><Paperclip size={19} /></button><button aria-label="ハッシュタグを追加"><Hash size={19} /></button><button aria-label="投稿を削除"><Trash2 size={18} /></button></div><div className="character-count"><span className={post.length > maxCharacters - 30 ? 'near-limit' : ''}>{post.length}</span> / {maxCharacters}<button className="schedule-button draft-save-button" disabled={!post.trim()} onClick={handleSaveDraft}><FileText size={16} /> 下書き保存</button><span className="schedule-wrap"><button className="schedule-button" disabled={!post.trim() || isOverLimit} aria-expanded={isScheduleOpen} onClick={() => isScheduleOpen ? setIsScheduleOpen(false) : openSchedule()}><Clock3 size={16} /> 予約投稿</button>{isScheduleOpen && (
+            <section className="composer-grid"><div className="composer-card"><div className="composer-toolbar"><div className="account-pill"><span className="x-mini">{platformInfo.symbol}</span><span><b>{isConnected ? `@${username}` : `${platformInfo.label}アカウント`}</b><small>{platformInfo.label}へ投稿</small></span><ChevronDown size={14} /></div>{editingDraftId && <span className="draft-pill"><FileText size={13} /> 下書きを編集中</span>}<button className="more-button" aria-label="その他"><MoreHorizontal size={19} /></button></div><textarea value={post} onChange={(event) => setPost(event.target.value.slice(0, maxCharacters))} placeholder="世界に向けて発信しましょう…" />{images.length > 0 && (
+                <ul className="attachment-grid" aria-label="添付画像">
+                  {images.map((item) => <li key={item.id}><img src={item.url} alt={item.file.name} /><button type="button" onClick={() => removeImage(item.id)} aria-label={`${item.file.name} を削除`} title="画像を削除"><X size={14} /></button></li>)}
+                </ul>
+              )}<div className="composer-footer"><div className="format-actions"><input ref={imageInputRef} type="file" accept={imageTypes.join(',')} multiple hidden onChange={handleSelectImages} /><button type="button" aria-label="画像を追加" title={images.length >= maxImages ? `画像は${maxImages}枚までです` : `画像を追加(JPEG・PNG、5MBまで、${maxImages}枚まで)`} disabled={images.length >= maxImages} onClick={() => imageInputRef.current?.click()}><Image size={19} />{images.length > 0 && <span className="attachment-count">{images.length}</span>}</button><button type="button" aria-label="ファイルを添付" title="画像ファイルを添付" disabled={images.length >= maxImages} onClick={() => imageInputRef.current?.click()}><Paperclip size={19} /></button><button aria-label="ハッシュタグを追加"><Hash size={19} /></button><button aria-label="投稿を削除"><Trash2 size={18} /></button></div><div className="character-count"><span className={post.length > maxCharacters - 30 ? 'near-limit' : ''}>{post.length}</span> / {maxCharacters}<button className="schedule-button draft-save-button" disabled={!post.trim()} onClick={handleSaveDraft}><FileText size={16} /> 下書き保存</button><span className="schedule-wrap"><button className="schedule-button" disabled={!post.trim() || isOverLimit} aria-expanded={isScheduleOpen} onClick={() => isScheduleOpen ? setIsScheduleOpen(false) : openSchedule()}><Clock3 size={16} /> 予約投稿</button>{isScheduleOpen && (
                 <form className="schedule-popover" onSubmit={handleSchedule}>
                   <label htmlFor="schedule-at">投稿する日時</label>
                   <input id="schedule-at" type="datetime-local" value={scheduleAt} min={toLocalInputValue(new Date())} onChange={(event) => setScheduleAt(event.target.value)} required />
                   <p>予約はこのブラウザに保存されます。</p>
                   <div><button type="button" className="outline-button" onClick={() => setIsScheduleOpen(false)}>キャンセル</button><button type="submit" className="post-button" disabled={!scheduleAt}>予約する</button></div>
                 </form>
-              )}</span><button className="post-button" disabled={!isConnected || !post.trim() || isOverLimit || isPosting} onClick={handlePost}><Send size={16} /> {isPosting ? '投稿中...' : '今すぐ投稿'}</button></div></div></div><aside className="preview-card"><div className="preview-label"><span>プレビュー</span><span className="live-dot">LIVE</span></div><div className="preview-post"><div className="preview-user"><span className="avatar peach">{initial}</span><div><b>{isConnected ? displayName : 'あなたのアカウント'}</b><span>@{isConnected ? username : 'username'} · 今</span></div><span className="preview-x">{platformInfo.symbol}</span></div><p>{post || '入力した投稿内容がここに表示されます。'}</p><div className="preview-actions"><span>♡ 0</span><span>↻ 0</span><span>♧ 0</span><MoreHorizontal size={15} /></div></div><div className="preview-tip"><Sparkles size={15} /><span><b>印象に残る投稿に</b><br />短く、わかりやすく、あなたらしく。</span></div></aside></section>
+              )}</span><button className="post-button" disabled={!isConnected || (!post.trim() && images.length === 0) || isOverLimit || isPosting} onClick={handlePost}><Send size={16} /> {isPosting ? '投稿中...' : '今すぐ投稿'}</button></div></div></div><aside className="preview-card"><div className="preview-label"><span>プレビュー</span><span className="live-dot">LIVE</span></div><div className="preview-post"><div className="preview-user"><span className="avatar peach">{initial}</span><div><b>{isConnected ? displayName : 'あなたのアカウント'}</b><span>@{isConnected ? username : 'username'} · 今</span></div><span className="preview-x">{platformInfo.symbol}</span></div><p>{post || (images.length ? '' : '入力した投稿内容がここに表示されます。')}</p>{images.length > 0 && <div className={`preview-images count-${images.length}`}>{images.map((item) => <img key={item.id} src={item.url} alt="" />)}</div>}<div className="preview-actions"><span>♡ 0</span><span>↻ 0</span><span>♧ 0</span><MoreHorizontal size={15} /></div></div><div className="preview-tip"><Sparkles size={15} /><span><b>印象に残る投稿に</b><br />短く、わかりやすく、あなたらしく。</span></div></aside></section>
             </>
           )}
           {view === 'drafts' && (

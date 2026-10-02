@@ -90,7 +90,29 @@
 - 表示件数は別に絞っていない。保存されている分(最大50件)をすべて通知パネルに表示する。
 - SNS・アカウントで分けず、まとめて50件。localStorage に保存する(予約・下書きと同じく、開発と本番では別)。
 
-## 7. App Review(審査)— 保留中
+## 7. 画像の添付
+
+作成画面の画像ボタンで、投稿に画像を付けられる。
+
+- JPEG・PNG、1枚5MBまで、**4枚まで**(X と Threads の両方で使える範囲)。値は [src/App.jsx](../src/App.jsx) と [worker/index.js](../worker/index.js) の `maxImages`・`maxImageBytes`・`imageTypes`。変えるときはそろえる。
+- 画像があるときは、画面から Worker へ `multipart/form-data`(`text`、`accountId`、`images`)で送る。テキストだけなら今までどおり JSON。
+- 画像だけの投稿もできる(本文は空でよい)。
+- **下書き・予約には画像を保存しない**(localStorage に入りきらないため)。保存すると「画像は保存されません」と表示する。
+
+### X
+
+- 画像ごとに `POST /2/media/upload` でアップロードし、返った ID を投稿の `media.media_ids` に付ける。**アップロードもクレジットを消費する**。
+- 連携の scope に `media.write` を追加した。**追加前に連携したトークンでは画像を投稿できないため、連携し直す**(403 のときは画面にもそう表示する)。
+
+### Threads
+
+- Threads は画像を URL で受け取り、Meta のサーバーがその URL から画像を取りに来る。そのため Worker が画像を **KV に1時間だけ保存**し、`/api/media/{ランダムな32文字}` で返す。
+- 1枚なら `IMAGE`、2枚以上なら `CAROUSEL`(各画像のコンテナ → まとめるコンテナ → 公開)。Meta が画像を取り込むまで公開できないため、コンテナの `status` が `FINISHED` になるまで待つ(最大10回、1.5秒おき)。
+- `/api/media/*` はセッションを作らない(Meta のアクセスで KV の書き込みを増やさないため)。画像1枚につき KV の書き込みは1回。
+- **開発環境(localhost)では使えない**。Meta から localhost に届かないため、Worker がエラーを返す。
+- **本番では Cloudflare Access の Bypass が必要**。サイト全体が Access で守られているため、そのままでは Meta が画像を取りに来られず投稿に失敗する。Zero Trust でアプリケーションを追加し、パス `sns-posting.tryoma0227.workers.dev/api/media/*` に **Bypass(Everyone)** のポリシーを付ける。URL はランダムで1時間で消えるため、公開しても推測されにくい。
+
+## 8. App Review(審査)— 保留中
 
 ほかの人の投稿を検索するには、`threads_keyword_search` のアドバンスアクセスが必要。**今は申請を保留している**。基本の流れは [threads-api.md](threads-api.md) の4章「ライブにする場合」。ここではそれ以外に必要なことをまとめる。
 
