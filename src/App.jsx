@@ -30,7 +30,15 @@ const platforms = {
 }
 const platformKeys = Object.keys(platforms)
 const platformStorageKey = 'sns-posting-platform'
-const emptyAccount = { connected: false, username: '', name: '', profile: null }
+const emptyAccount = { connected: false, userId: '', username: '', name: '', profile: null }
+
+// 予約が連携中のアカウントのものか。true/false、記録がない古い予約は null
+function isSameAccount(item, account) {
+  if (!account.connected) return false
+  if (item.accountId && account.userId) return item.accountId === account.userId
+  if (item.accountUsername) return item.accountUsername === account.username
+  return null
+}
 const emptyArchive = { posts: [], loadedAt: null, error: '', isLoading: false }
 
 function loadStoredPlatform() {
@@ -107,6 +115,9 @@ function App() {
   const [scheduleAt, setScheduleAt] = useState('')
   // 予約は選択中のワークスペース(SNS)の分だけ表示する。以前の予約はXとして扱う
   const sortedScheduledPosts = scheduledPosts.filter((item) => (item.platform || 'x') === platform).sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt))
+  // 連携中のアカウントで予約したものと、それ以外(別アカウント・アカウント不明)に分ける
+  const ownScheduledPosts = sortedScheduledPosts.filter((item) => isSameAccount(item, accounts[platform]) === true)
+  const otherScheduledPosts = sortedScheduledPosts.filter((item) => isSameAccount(item, accounts[platform]) !== true)
   const [drafts, setDrafts] = useState(() => loadStoredList(draftStorageKey))
   // 下書きから開いて編集中の場合はそのID(保存すると上書き、投稿・予約すると削除する)
   const [editingDraftId, setEditingDraftId] = useState(null)
@@ -165,7 +176,7 @@ function App() {
       for (const result of results) {
         if (result.status !== 'fulfilled') continue
         const [key, data] = result.value
-        setAccounts((current) => ({ ...current, [key]: { connected: data.connected, username: data.username || '', name: data.name || '', profile: data.profile || null } }))
+        setAccounts((current) => ({ ...current, [key]: { connected: data.connected, userId: data.userId || '', username: data.username || '', name: data.name || '', profile: data.profile || null } }))
         if (connectResultRef.current[key] && data.connected) {
           connectResultRef.current[key] = false
           addNotification('success', `${platforms[key].label}アカウントを連携しました`, `@${data.username}`)
@@ -275,14 +286,15 @@ function App() {
     // 編集中の下書きは元のSNSのものなので、切り替えたら新規作成として扱う
     setEditingDraftId(null)
   }
-  const publishPost = async (text, target = platform) => {
+  // accountId を渡すと、Worker 側でも連携中のアカウントと一致するか確認する
+  const publishPost = async (text, target = platform, accountId = '') => {
     const label = platforms[target].label
     if (!text.trim() || !accounts[target].connected || isPosting) return false
     setIsPosting(true)
     let response
     let result
     try {
-      response = await fetch(`/api/${target}/posts`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) })
+      response = await fetch(`/api/${target}/posts`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, accountId }) })
       result = await response.json()
     } catch {
       showError(`${label}への投稿に失敗しました。APIサーバーの状態を確認してください。`)
@@ -364,7 +376,9 @@ function App() {
     const scheduledAt = new Date(scheduleAt)
     if (!post.trim() || isOverLimit || Number.isNaN(scheduledAt.getTime())) return
     if (scheduledAt <= new Date()) { showError('予約日時は現在より後の日時を指定してください。'); return }
-    const item = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, platform, text: post.trim(), scheduledAt: scheduledAt.toISOString(), createdAt: new Date().toISOString() }
+    if (!isConnected) { showError(`予約するには${platformInfo.label}アカウントを連携してください。`); return }
+    // どのアカウントで予約したかを残し、別のアカウントから投稿しないようにする
+    const item = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, platform, accountId: accounts[platform].userId, accountUsername: username, text: post.trim(), scheduledAt: scheduledAt.toISOString(), createdAt: new Date().toISOString() }
     setScheduledPosts((current) => [...current, item])
     setIsScheduleOpen(false)
     setPost('')
@@ -378,7 +392,36 @@ function App() {
   const removeScheduled = (id) => setScheduledPosts((current) => current.filter((item) => item.id !== id))
 
   const publishScheduled = async (item) => {
-    if (await publishPost(item.text, item.platform || 'x')) removeScheduled(item.id)
+    const target = item.platform || 'x'
+    const account = accounts[target]
+    const same = isSameAccount(item, account)
+    if (same === false) {
+      const message = `この予約は @${item.accountUsername} で作成されています。@${item.accountUsername} を連携してから投稿してください。`
+      showError(message)
+      addNotification('error', `${platforms[target].label}の予約を投稿しませんでした`, message)
+      return
+    }
+    if (same === null && !window.confirm(`予約したアカウントが記録されていない予約です。連携中の @${account.username} から投稿しますか？`)) return
+    if (await publishPost(item.text, target, item.accountId || '')) removeScheduled(item.id)
+  }
+
+  // showAccount: 別アカウント・アカウント不明の予約には、予約したアカウント名を表示する
+  const renderScheduledRow = (item, showAccount) => {
+    const date = new Date(item.scheduledAt)
+    const isOverdue = date <= new Date()
+    return (
+      <div className="upcoming-row archive-row" key={item.id}>
+        <div className="date-block"><b>{date.getDate()}</b><span>{date.getMonth() + 1}月</span></div>
+        <div className="upcoming-content">
+          <div className="upcoming-meta">{isOverdue ? <span className="draft-pill overdue-pill"><AlertCircle size={13} /> 予定時刻を過ぎています</span> : <span className="scheduled-pill"><Clock3 size={13} /> 予約済み</span>}{showAccount && <span className="draft-pill account-pill-small">{item.accountUsername ? `@${item.accountUsername}` : 'アカウント不明'}</span>}<span>{formatScheduledAt(item.scheduledAt)}</span></div>
+          <p>{item.text}</p>
+        </div>
+        <div className="scheduled-actions">
+          <button className="more-button" disabled={!isConnected || isPosting} onClick={() => publishScheduled(item)} aria-label="今すぐ投稿" title={isConnected ? '今すぐ投稿' : `${platformInfo.label}アカウントを連携すると投稿できます`}><Send size={16} /></button>
+          <button className="more-button" onClick={() => removeScheduled(item.id)} aria-label="予約を削除" title="予約を削除"><Trash2 size={16} /></button>
+        </div>
+      </div>
+    )
   }
 
   const connectionCard = <section className="connection-card"><div className="x-symbol">{platformInfo.symbol}</div><div className="connection-copy"><span className="eyebrow">アカウント連携</span><h2>{isConnected ? `@${username}` : `${platformInfo.label}アカウントを連携`}</h2><p>{isConnected ? '投稿の準備ができています。' : '一度連携すれば、あなたのアカウントへ直接投稿できます。'}</p></div><div className="connection-status">{isConnected ? <><span className="status-dot connected" /> 連携済み</> : <><span className="status-dot" /> 未連携</>}</div><button className={isConnected ? 'disconnect-button' : 'connect-button'} onClick={isConnected ? handleDisconnect : handleConnect}>{isConnected ? '連携を解除' : `${platformInfo.label}を連携`} <Link2 size={16} /></button></section>
@@ -462,23 +505,9 @@ function App() {
               <div className="section-heading"><div><p className="eyebrow">クイックアクション</p><h2>何を投稿しますか？</h2></div><a className="connect-button quick-compose" href="#compose"><PenLine size={16} /> 投稿を作成</a></div>
             <section className="lower-grid single"><div className="recent-section"><div className="section-heading compact scheduled-heading"><div><p className="eyebrow">次の投稿 · このブラウザで予約</p><h2>予約済みの投稿</h2></div><a href="#compose">予約を追加 <PenLine size={14} /></a></div>
               {sortedScheduledPosts.length === 0 && <p className="archive-empty">予約した投稿はありません。作成画面の「予約投稿」から追加できます。</p>}
-              {sortedScheduledPosts.map((item) => {
-                const date = new Date(item.scheduledAt)
-                const isOverdue = date <= new Date()
-                return (
-                  <div className="upcoming-row archive-row" key={item.id}>
-                    <div className="date-block"><b>{date.getDate()}</b><span>{date.getMonth() + 1}月</span></div>
-                    <div className="upcoming-content">
-                      <div className="upcoming-meta">{isOverdue ? <span className="draft-pill overdue-pill"><AlertCircle size={13} /> 予定時刻を過ぎています</span> : <span className="scheduled-pill"><Clock3 size={13} /> 予約済み</span>}<span>{formatScheduledAt(item.scheduledAt)}</span></div>
-                      <p>{item.text}</p>
-                    </div>
-                    <div className="scheduled-actions">
-                      <button className="more-button" disabled={!isConnected || isPosting} onClick={() => publishScheduled(item)} aria-label="今すぐ投稿" title={isConnected ? '今すぐ投稿' : `${platformInfo.label}アカウントを連携すると投稿できます`}><Send size={16} /></button>
-                      <button className="more-button" onClick={() => removeScheduled(item.id)} aria-label="予約を削除" title="予約を削除"><Trash2 size={16} /></button>
-                    </div>
-                  </div>
-                )
-              })}
+              {ownScheduledPosts.map((item) => renderScheduledRow(item, false))}
+              {otherScheduledPosts.length > 0 && <p className="eyebrow scheduled-group-label">{isConnected ? 'ほかのアカウントの予約' : '連携するアカウントの予約'}</p>}
+              {otherScheduledPosts.map((item) => renderScheduledRow(item, true))}
             </div></section>
             <section className="archive-section" id="archive">
               <div className="section-heading compact"><div><p className="eyebrow">アーカイブ · 最新{archiveLimit}件</p><h2>これまでの投稿</h2></div>{isConnected && <a href={platformInfo.profileUrl(username)} target="_blank" rel="noreferrer">{platformInfo.label}で見る <ExternalLink size={14} /></a>}</div>

@@ -1641,3 +1641,13 @@ button.profile[aria-expanded='true'] {
     display: none;
   }
 }
+
+/* 予約したアカウント名(別アカウント・アカウント不明の予約) */
+.account-pill-small {
+  background: #eeedf2;
+  color: #5a5663;
+}
+
+.scheduled-group-label {
+  margin: 18px 0 4px;
+}

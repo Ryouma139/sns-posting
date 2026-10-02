@@ -148,9 +148,17 @@ async function xGetPosts(session) {
   return json({ posts: result.data || [] })
 }
 
+// 予約投稿は予約したアカウントのIDを送ってくる。連携中のアカウントと違えば投稿しない
+function accountMismatch(body, data) {
+  if (!body?.accountId || !data?.userId || body.accountId === data.userId) return null
+  return json({ error: '予約したアカウントと、連携中のアカウントが違います。' }, 409)
+}
+
 async function xCreatePost(request, session) {
   if (!session.data.accessToken) return json({ error: 'Xアカウントが連携されていません。' }, 401)
   const body = await request.json().catch(() => null)
+  const mismatch = accountMismatch(body, session.data)
+  if (mismatch) return mismatch
   const text = typeof body?.text === 'string' ? body.text.trim() : ''
   if (!text || text.length > 280) return json({ error: '投稿本文は1文字以上280文字以内で入力してください。' }, 400)
   const xResponse = await fetch('https://api.x.com/2/tweets', { method: 'POST', headers: { Authorization: `Bearer ${session.data.accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) })
@@ -251,6 +259,8 @@ async function threadsCreatePost(request, session) {
   const threads = session.data.threads
   if (!threads?.accessToken) return json({ error: 'Threadsアカウントが連携されていません。' }, 401)
   const body = await request.json().catch(() => null)
+  const mismatch = accountMismatch(body, threads)
+  if (mismatch) return mismatch
   const text = typeof body?.text === 'string' ? body.text.trim() : ''
   if (!text || text.length > 500) return json({ error: '投稿本文は1文字以上500文字以内で入力してください。' }, 400)
   try {
@@ -266,7 +276,7 @@ async function threadsCreatePost(request, session) {
 // ---- ルーティング ----
 
 function status(data) {
-  return json({ connected: Boolean(data?.accessToken), username: data?.username || null, name: data?.name || null, profile: data?.profile || null })
+  return json({ connected: Boolean(data?.accessToken), userId: data?.userId || null, username: data?.username || null, name: data?.name || null, profile: data?.profile || null })
 }
 
 async function route(request, env, session, url) {
