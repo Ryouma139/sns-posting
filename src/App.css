@@ -1651,3 +1651,71 @@ button.profile[aria-expanded='true'] {
 .scheduled-group-label {
   margin: 18px 0 4px;
 }
+
+/* API利用状況 */
+.usage-note {
+  margin-top: 32px;
+}
+
+.kpi-tile .usage-total {
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.usage-meter {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #eeedf2;
+}
+
+.usage-meter i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
+
+.usage-meter.high i {
+  background: var(--coral-dark);
+}
+
+.usage-limits {
+  display: grid;
+  gap: 0;
+  margin: 16px 0 0;
+  border: 1.5px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+}
+
+.usage-limits div {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 16px;
+  padding: 14px 20px;
+}
+
+.usage-limits div + div {
+  border-top: 1px solid var(--line);
+}
+
+.usage-limits dt {
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.usage-limits dd {
+  margin: 0;
+  color: #5a5663;
+  font-size: 12px;
+}
+
+@media (max-width: 640px) {
+  .usage-limits div {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+}

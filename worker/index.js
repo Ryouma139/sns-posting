@@ -275,6 +275,31 @@ async function threadsCreatePost(request, session) {
 
 // ---- ルーティング ----
 
+// 投稿・返信の上限と、直近24時間の消費数(Threads の threads_publishing_limit)
+async function threadsGetUsage(session) {
+  const threads = session.data.threads
+  if (!threads?.accessToken) return json({ error: 'Threadsアカウントが連携されていません。' }, 401)
+  const path = (fields) => `/v1.0/${threads.userId || 'me'}/threads_publishing_limit?fields=${fields}`
+  try {
+    let result
+    try {
+      result = await threadsFetch(path('quota_usage,config,reply_quota_usage,reply_config'), threads.accessToken)
+    } catch {
+      // 返信の項目が取れない場合は、投稿の項目だけで取り直す
+      result = await threadsFetch(path('quota_usage,config'), threads.accessToken)
+    }
+    const limit = result.data?.[0] || {}
+    const quota = (usage, config) => (config ? { used: usage ?? 0, total: config.quota_total ?? null, durationSeconds: config.quota_duration ?? null } : null)
+    return json({
+      posts: quota(limit.quota_usage, limit.config),
+      replies: quota(limit.reply_quota_usage, limit.reply_config),
+      checkedAt: new Date().toISOString(),
+    })
+  } catch (usageError) {
+    return threadsError(usageError, 'API利用状況の取得に失敗しました。')
+  }
+}
+
 function status(data) {
   return json({ connected: Boolean(data?.accessToken), userId: data?.userId || null, username: data?.username || null, name: data?.name || null, profile: data?.profile || null })
 }
@@ -299,6 +324,7 @@ async function route(request, env, session, url) {
       session.dirty = true
       return json({ connected: false })
     case 'GET /api/threads/posts': return threadsGetPosts(session)
+    case 'GET /api/threads/usage': return threadsGetUsage(session)
     case 'POST /api/threads/posts': return threadsCreatePost(request, session)
     default: return json({ error: 'Not Found' }, 404)
   }

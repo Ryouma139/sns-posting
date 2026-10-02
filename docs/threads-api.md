@@ -244,6 +244,15 @@ POST https://graph.threads.net/v1.0/me/threads_publish?creation_id=...&access_to
 
 無料プランは枠を超えても自動課金されず、エラーで止まる。
 
+### API 利用状況の画面
+
+サイドバーの「**API利用状況**」(`#usage`)で、Threads の投稿・返信の上限と直近24時間の消費数を表示する。
+
+- Worker の `GET /api/threads/usage`(`threadsGetUsage`)が、Threads の `GET /{ユーザーID}/threads_publishing_limit?fields=quota_usage,config,reply_quota_usage,reply_config` を呼ぶ。返信の項目が取れなければ投稿の項目だけで取り直す。
+- 画面を開いたとき、「最新に更新」を押したときに取得する(1回 = Threads API 1回)。
+- API 呼び出し回数の上限(24時間で 4,800 × 表示回数)の残りは API から取得できないため、表示していない。
+- X は Developer Portal の Usage で確認する。
+
 ### 取得件数(最新20件)
 
 - 固定値。[src/App.jsx](../src/App.jsx) の `archiveLimit`、[worker/index.js](../worker/index.js) の Threads `limit=20` と X `max_results: '20'` の3か所。変えるときはそろえる。

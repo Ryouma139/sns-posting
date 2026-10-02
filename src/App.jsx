@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import { Archive, BarChart3, Heart, LogOut, MapPin, MessageCircle, Repeat2, Bell, CalendarDays, AlertCircle, Check, ChevronDown, Info, Clock3, Command, ExternalLink, FileText, Hash, Image, LayoutDashboard, Link2, MoreHorizontal, Paperclip, PenLine, Send, Settings2, Sparkles, Trash2, X } from 'lucide-react'
+import { Archive, BarChart3, Heart, LogOut, MapPin, MessageCircle, Repeat2, Bell, CalendarDays, AlertCircle, Check, ChevronDown, Info, Clock3, Command, ExternalLink, FileText, Gauge, Hash, Image, LayoutDashboard, Link2, MoreHorizontal, Paperclip, PenLine, Send, Settings2, Sparkles, Trash2, X } from 'lucide-react'
 import './App.css'
 
 // サイドバーから切り替える画面(それ以外のハッシュは概要画面内の位置として扱う)
-const pageTitles = { dashboard: '概要', compose: '作成', analytics: '分析', drafts: '下書き' }
+const pageTitles = { dashboard: '概要', compose: '作成', analytics: '分析', drafts: '下書き', usage: 'API利用状況' }
 
 function getViewFromHash(hash) {
   return pageTitles[hash] ? hash : 'dashboard'
@@ -32,7 +32,7 @@ const platformKeys = Object.keys(platforms)
 const platformStorageKey = 'sns-posting-platform'
 const emptyAccount = { connected: false, userId: '', username: '', name: '', profile: null }
 
-// 予約が連携中のアカウントのものか。true/false、記録がない古い予約は null
+// 予約・下書きが連携中のアカウントのものか。true/false、アカウントの記録がない古いデータは null
 function isSameAccount(item, account) {
   if (!account.connected) return false
   if (item.accountId && account.userId) return item.accountId === account.userId
@@ -75,6 +75,12 @@ function saveStoredList(key, list) {
 function toLocalInputValue(date) {
   const pad = (value) => String(value).padStart(2, '0')
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+// 上限の集計期間(秒)を「24時間」などにする
+function formatDuration(seconds) {
+  if (!seconds) return ''
+  return seconds % 3600 === 0 ? `${seconds / 3600}時間` : `${Math.round(seconds / 60)}分`
 }
 
 function formatScheduledAt(value) {
@@ -123,6 +129,9 @@ function App() {
   const [editingDraftId, setEditingDraftId] = useState(null)
   // 下書きも選択中のワークスペース(SNS)の分だけ、更新が新しい順に表示する
   const sortedDrafts = drafts.filter((item) => item.platform === platform).sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
+  // 連携中のアカウントの下書きと、それ以外(別アカウント)に分ける。アカウント不明の古い下書きは誰でも開ける
+  const ownDrafts = sortedDrafts.filter((item) => isSameAccount(item, accounts[platform]) !== false)
+  const otherDrafts = sortedDrafts.filter((item) => isSameAccount(item, accounts[platform]) === false)
   const [notice, setNotice] = useState('')
   const [isNoticeError, setIsNoticeError] = useState(false)
   const maxCharacters = platformInfo.maxCharacters
@@ -286,6 +295,31 @@ function App() {
     // 編集中の下書きは元のSNSのものなので、切り替えたら新規作成として扱う
     setEditingDraftId(null)
   }
+  // API利用状況(Threadsの投稿・返信の上限と直近24時間の消費数)
+  const [usage, setUsage] = useState(null)
+  const [usageError, setUsageError] = useState('')
+  const [isUsageLoading, setIsUsageLoading] = useState(false)
+  const loadUsage = async () => {
+    setIsUsageLoading(true)
+    setUsageError('')
+    try {
+      const response = await fetch('/api/threads/usage')
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || `エラー ${response.status}`)
+      setUsage(result)
+    } catch (loadError) {
+      setUsageError(loadError.message || 'API利用状況の取得に失敗しました。')
+    } finally {
+      setIsUsageLoading(false)
+    }
+  }
+  const usageConnected = accounts.threads.connected
+  useEffect(() => {
+    // 画面を開いたときに取得する。投稿のたびに数が変わるので、開くたびに取り直す
+    if (view === 'usage' && platform === 'threads' && usageConnected) loadUsage()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, platform, usageConnected])
+
   // accountId を渡すと、Worker 側でも連携中のアカウントと一致するか確認する
   const publishPost = async (text, target = platform, accountId = '') => {
     const label = platforms[target].label
@@ -329,14 +363,28 @@ function App() {
     setEditingDraftId(null)
   }
 
+  // 下書きを作ったアカウントと連携中のアカウントが違えば、エラーを出して true を返す
+  const rejectOtherAccountDraft = (item) => {
+    if (isSameAccount(item, accounts[item.platform]) !== false) return false
+    const message = `この下書きは @${item.accountUsername} で作成されています。@${item.accountUsername} を連携してから編集してください。`
+    showError(message)
+    addNotification('error', `${platforms[item.platform].label}の下書きを開けませんでした`, message)
+    return true
+  }
+
   const handleSaveDraft = () => {
     const text = post.trim()
     if (!text) return
+    if (!isConnected) { showError(`下書きを保存するには${platformInfo.label}アカウントを連携してください。`); return }
     const updatedAt = new Date().toISOString()
-    if (editingDraftId && drafts.some((item) => item.id === editingDraftId)) {
-      setDrafts((current) => current.map((item) => item.id === editingDraftId ? { ...item, text, updatedAt } : item))
+    // 下書きには作成したアカウントを残す(アカウント不明の古い下書きは、保存したアカウントのものにする)
+    const owner = { accountId: accounts[platform].userId, accountUsername: username }
+    const editingDraft = editingDraftId && drafts.find((item) => item.id === editingDraftId)
+    if (editingDraft) {
+      if (rejectOtherAccountDraft(editingDraft)) return
+      setDrafts((current) => current.map((item) => item.id === editingDraftId ? { ...item, ...(item.accountId || item.accountUsername ? {} : owner), text, updatedAt } : item))
     } else {
-      const item = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, platform, text, createdAt: updatedAt, updatedAt }
+      const item = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, platform, ...owner, text, createdAt: updatedAt, updatedAt }
       setDrafts((current) => [...current, item])
       setEditingDraftId(item.id)
     }
@@ -346,6 +394,7 @@ function App() {
   }
 
   const openDraft = (item) => {
+    if (rejectOtherAccountDraft(item)) return
     setPost(item.text.slice(0, maxCharacters))
     setEditingDraftId(item.id)
     setIsScheduleOpen(false)
@@ -355,6 +404,24 @@ function App() {
   const removeDraft = (id) => {
     setDrafts((current) => current.filter((item) => item.id !== id))
     if (id === editingDraftId) setEditingDraftId(null)
+  }
+
+  // showAccount: 別アカウントの下書きには、作成したアカウント名を表示する
+  const renderDraftRow = (item, showAccount) => {
+    const date = new Date(item.updatedAt)
+    return (
+      <div className="upcoming-row archive-row" key={item.id}>
+        <div className="date-block"><b>{date.getDate()}</b><span>{date.getMonth() + 1}月</span></div>
+        <button className="upcoming-content draft-open" onClick={() => openDraft(item)}>
+          <div className="upcoming-meta"><span className="draft-pill"><FileText size={13} /> 下書き</span>{showAccount && <span className="draft-pill account-pill-small">@{item.accountUsername}</span>}<span>{date.toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} に保存 · {item.text.length}文字</span></div>
+          <p>{item.text}</p>
+        </button>
+        <div className="scheduled-actions">
+          <button className="more-button" onClick={() => openDraft(item)} aria-label="下書きを編集" title="下書きを編集"><PenLine size={16} /></button>
+          <button className="more-button" onClick={() => removeDraft(item.id)} aria-label="下書きを削除" title="下書きを削除"><Trash2 size={16} /></button>
+        </div>
+      </div>
+    )
   }
 
   const startNewPost = () => {
@@ -445,7 +512,7 @@ function App() {
             </div>
           )}
         </div>
-        <nav><p className="nav-label">メニュー</p><a className={view === 'dashboard' ? 'active' : undefined} href="#dashboard"><LayoutDashboard size={17} /> 概要</a><a className={view === 'compose' ? 'active' : undefined} href="#compose"><PenLine size={17} /> 作成 <span className="nav-count">1</span></a><a href="#calendar"><CalendarDays size={17} /> カレンダー</a><a className={view === 'analytics' ? 'active' : undefined} href="#analytics"><BarChart3 size={17} /> 分析</a><p className="nav-label">管理</p><a className={view === 'drafts' ? 'active' : undefined} href="#drafts"><FileText size={17} /> 下書き {sortedDrafts.length > 0 && <span className="nav-count muted">{sortedDrafts.length}</span>}</a><a href="#settings"><Settings2 size={17} /> 設定</a><a href="#archive"><Archive size={17} /> 投稿アーカイブ</a></nav>
+        <nav><p className="nav-label">メニュー</p><a className={view === 'dashboard' ? 'active' : undefined} href="#dashboard"><LayoutDashboard size={17} /> 概要</a><a className={view === 'compose' ? 'active' : undefined} href="#compose"><PenLine size={17} /> 作成 <span className="nav-count">1</span></a><a href="#calendar"><CalendarDays size={17} /> カレンダー</a><a className={view === 'analytics' ? 'active' : undefined} href="#analytics"><BarChart3 size={17} /> 分析</a><p className="nav-label">管理</p><a className={view === 'drafts' ? 'active' : undefined} href="#drafts"><FileText size={17} /> 下書き {sortedDrafts.length > 0 && <span className="nav-count muted">{sortedDrafts.length}</span>}</a><a href="#settings"><Settings2 size={17} /> 設定</a><a href="#archive"><Archive size={17} /> 投稿アーカイブ</a><a className={view === 'usage' ? 'active' : undefined} href="#usage"><Gauge size={17} /> API利用状況</a></nav>
         <div className="sidebar-foot"><div className="help-icon"><Sparkles size={17} /></div><div><strong>お困りですか？</strong><small>クイックガイドを読む</small></div><ExternalLink size={14} /></div>
       </aside>
       <main className="main-content" id="dashboard">
@@ -554,24 +621,50 @@ function App() {
               <section className="archive-section">
                 <div className="recent-section">
                   {sortedDrafts.length === 0 && <p className="archive-empty">下書きはありません。作成画面の「下書き保存」から追加できます。</p>}
-                  {sortedDrafts.map((item) => {
-                    const date = new Date(item.updatedAt)
-                    return (
-                      <div className="upcoming-row archive-row" key={item.id}>
-                        <div className="date-block"><b>{date.getDate()}</b><span>{date.getMonth() + 1}月</span></div>
-                        <button className="upcoming-content draft-open" onClick={() => openDraft(item)}>
-                          <div className="upcoming-meta"><span className="draft-pill"><FileText size={13} /> 下書き</span><span>{date.toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} に保存 · {item.text.length}文字</span></div>
-                          <p>{item.text}</p>
-                        </button>
-                        <div className="scheduled-actions">
-                          <button className="more-button" onClick={() => openDraft(item)} aria-label="下書きを編集" title="下書きを編集"><PenLine size={16} /></button>
-                          <button className="more-button" onClick={() => removeDraft(item.id)} aria-label="下書きを削除" title="下書きを削除"><Trash2 size={16} /></button>
-                        </div>
-                      </div>
-                    )
-                  })}
+                  {ownDrafts.map((item) => renderDraftRow(item, false))}
+                  {otherDrafts.length > 0 && <p className="eyebrow scheduled-group-label">{isConnected ? 'ほかのアカウントの下書き' : '連携するアカウントの下書き'}</p>}
+                  {otherDrafts.map((item) => renderDraftRow(item, true))}
                 </div>
               </section>
+            </>
+          )}
+          {view === 'usage' && (
+            <>
+              <section className="intro"><div><p className="eyebrow">{platformInfo.label} · 直近24時間</p><h1>API利用状況<span>。</span></h1><p className="subcopy">Threads API の上限と、現在どれだけ使っているかを表示します。</p></div></section>
+              {platform !== 'threads' ? (
+                <p className="archive-empty usage-note">X の API 利用状況は、X Developer Portal の Usage で確認してください。左上のワークスペースを Threads に切り替えると、Threads の利用状況を表示します。</p>
+              ) : !isConnected ? connectionCard : (
+                <>
+                  {usageError && <p className="archive-empty usage-note">{usageError}</p>}
+                  {usage && (
+                    <section className="kpi-row" aria-label="Threads API の消費状況">
+                      {[['投稿', Send, usage.posts], ['返信', MessageCircle, usage.replies]].filter(([, , quota]) => quota).map(([label, Icon, quota]) => {
+                        const ratio = quota.total ? Math.min(quota.used / quota.total, 1) : 0
+                        return (
+                          <div className="kpi-tile" key={label}>
+                            <span><Icon size={13} /> {label}</span>
+                            <b>{quota.used.toLocaleString('ja-JP')}<small className="usage-total"> / {quota.total?.toLocaleString('ja-JP') ?? '-'}</small></b>
+                            <div className={`usage-meter${ratio >= 0.8 ? ' high' : ''}`} role="meter" aria-valuemin={0} aria-valuemax={quota.total || 0} aria-valuenow={quota.used} aria-label={`${label}の消費`}><i style={{ width: `${ratio * 100}%` }} /></div>
+                            <small>残り {quota.total ? (quota.total - quota.used).toLocaleString('ja-JP') : '-'}件 · 直近{formatDuration(quota.durationSeconds) || '24時間'}</small>
+                          </div>
+                        )
+                      })}
+                    </section>
+                  )}
+                  <div className="archive-footer"><span className="archive-note">{usage ? `${new Date(usage.checkedAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })} に取得 · ` : ''}時刻ごとに区切らず、直近24時間の件数で数えます</span><button className="outline-button" disabled={isUsageLoading} onClick={loadUsage}>{isUsageLoading ? '読み込み中...' : '最新に更新'}</button></div>
+                  <section className="archive-section">
+                    <div className="section-heading compact"><div><p className="eyebrow">Meta の仕様とこのアプリ</p><h2>主な上限</h2></div></div>
+                    <dl className="usage-limits">
+                      <div><dt>投稿</dt><dd>1アカウントにつき直近24時間で{usage?.posts?.total?.toLocaleString('ja-JP') ?? '250'}件まで。上の数値は Threads から取得した実際の値です。</dd></div>
+                      <div><dt>返信</dt><dd>1アカウントにつき直近24時間で{usage?.replies?.total?.toLocaleString('ja-JP') ?? '1,000'}件まで。</dd></div>
+                      <div><dt>本文</dt><dd>1投稿500文字まで。</dd></div>
+                      <div><dt>API呼び出し</dt><dd>直近24時間で「4,800 × 投稿の表示回数」回まで(Meta の仕様)。残りの回数は API から取得できないため、ここには表示していません。</dd></div>
+                      <div><dt>このアプリの呼び出し数</dt><dd>投稿1回で2回(作成と公開)。投稿アーカイブの読み込みで「1 + 投稿数」回(最大{archiveLimit + 1}回)。この画面の表示で1回。</dd></div>
+                      <div><dt>Cloudflare Workers</dt><dd>無料プランでは1リクエストあたり外部への呼び出しが50回まで。アーカイブの取得件数を増やすときに注意します。</dd></div>
+                    </dl>
+                  </section>
+                </>
+              )}
             </>
           )}
           {view === 'analytics' && (
