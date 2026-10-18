@@ -1,6 +1,6 @@
 // Cloudflare Workers 用 API。画面(dist)は静的アセットとして配信し、/api/* だけをこの Worker で処理する
 // セッションは KV(SESSIONS) に保存し、OAuth の state などは短命の Cookie に保存する
-// 予約投稿は D1(DB) に保存し、Cron Trigger(scheduled)で投稿する
+// 予約投稿は D1(DB) に保存し、Cron Trigger(scheduled)で投稿する。画像は R2(MEDIA) に保存する
 
 const threadsGraph = 'https://graph.threads.net'
 const sessionTtl = 86400
@@ -162,19 +162,21 @@ function accountMismatch(body, data) {
 }
 
 // ---- 添付画像 ----
-// 画像付きの投稿は multipart/form-data(text, accountId, images)、テキストだけなら JSON で受け取る
+// 画像付きの投稿・予約は multipart/form-data(text, accountId, topicTag, images。予約は platform, scheduledAt も)、
+// テキストだけなら JSON で受け取る
 const maxImages = 4
 const maxImageBytes = 5 * 1024 * 1024
 const imageTypes = ['image/jpeg', 'image/png']
+const postFields = ['text', 'accountId', 'topicTag', 'platform', 'scheduledAt', 'migrated']
 
 async function readPostBody(request) {
   if (!(request.headers.get('content-type') || '').includes('multipart/form-data')) {
     const body = await request.json().catch(() => null)
-    return { text: body?.text, accountId: body?.accountId, topicTag: body?.topicTag, images: [] }
+    return { ...Object.fromEntries(postFields.map((field) => [field, body?.[field]])), images: [] }
   }
   const form = await request.formData().catch(() => null)
   if (!form) return null
-  return { text: form.get('text'), accountId: form.get('accountId') || '', topicTag: form.get('topicTag'), images: form.getAll('images').filter((item) => typeof item !== 'string') }
+  return { ...Object.fromEntries(postFields.map((field) => [field, form.get(field) ?? undefined])), images: form.getAll('images').filter((item) => typeof item !== 'string') }
 }
 
 // Threads のトピックタグ(1投稿に1つ)。本文に「#」で書くと本文にも残るため、topic_tag で別に送る
@@ -325,6 +327,9 @@ async function threadsFetch(session, path, accessToken, options = {}) {
   if (!threadsResponse.ok) {
     const error = new Error(result.error?.message || 'Threads APIの呼び出しに失敗しました。')
     error.status = threadsResponse.status
+    // 原因の調査用に、Meta が返したエラーの種類とコードを残す(トークンは含まない)
+    error.detail = { path: url.pathname, status: threadsResponse.status, type: result.error?.type, code: result.error?.code, subcode: result.error?.error_subcode, fbtrace_id: result.error?.fbtrace_id }
+    console.error('Threads API error', JSON.stringify(error.detail))
     throw error
   }
   return result
@@ -406,20 +411,41 @@ async function threadsGetPosts(session) {
 }
 
 // Threads は画像を URL で受け取り、Meta のサーバーが取りに来る。
-// そのため画像を KV に一時保存し、/api/media/{ID} で公開する(Cloudflare Access の Bypass が必要)
-const mediaTtl = 3600
-
+// そのため画像を R2(MEDIA)に保存し、/api/media/{ID} で公開する(Cloudflare Access の Bypass が必要)
+// 予約投稿の画像も R2 に置き、X へは予定時刻に R2 から読んでアップロードする
+// R2 には期限がないため、投稿し終わったら(予約なら投稿済み・削除のときに)消す
 async function storeMedia(env, image) {
+  if (!env.MEDIA) {
+    const error = new Error('画像の保存先(R2)が設定されていません。')
+    error.status = 503
+    throw error
+  }
   const id = randomHex(16)
-  await env.SESSIONS.put(`media:${id}`, await image.arrayBuffer(), { expirationTtl: mediaTtl, metadata: { type: image.type } })
+  await env.MEDIA.put(`media/${id}`, image, { httpMetadata: { contentType: image.type } })
   return id
 }
 
+async function loadMedia(env, id) {
+  const object = await env.MEDIA?.get(`media/${id}`)
+  if (!object) throw new Error('予約した画像が見つかりませんでした。')
+  return new File([await object.arrayBuffer()], id, { type: object.httpMetadata?.contentType || 'image/jpeg' })
+}
+
+async function deleteMedia(env, ids) {
+  if (ids.length) await env.MEDIA?.delete(ids.map((id) => `media/${id}`)).catch((deleteError) => console.error(deleteError))
+}
+
+const mediaUrl = (origin, id) => `${origin}/api/media/${id}`
+
+// localhost の画像は Meta から取りに来られない
+const isLocalOrigin = (origin) => /^https?:\/\/(localhost|127\.0\.0\.1)(:|$)/.test(origin)
+const localImageError = 'Threadsへの画像付き投稿は本番環境でのみ使えます(Metaがlocalhostの画像を取得できないため)。'
+
 async function serveMedia(env, id) {
   if (!/^[0-9a-f]{32}$/.test(id)) return new Response('Not Found', { status: 404 })
-  const { value, metadata } = await env.SESSIONS.getWithMetadata(`media:${id}`, 'arrayBuffer')
-  if (!value) return new Response('Not Found', { status: 404 })
-  return new Response(value, { headers: { 'Content-Type': metadata?.type || 'application/octet-stream', 'Cache-Control': 'private, max-age=3600' } })
+  const object = await env.MEDIA?.get(`media/${id}`)
+  if (!object) return new Response('Not Found', { status: 404 })
+  return new Response(object.body, { headers: { 'Content-Type': object.httpMetadata?.contentType || 'application/octet-stream', 'Cache-Control': 'private, max-age=3600' } })
 }
 
 // 画像のコンテナは Meta が画像を取り込むまで公開できないため、FINISHED になるまで待つ
@@ -431,6 +457,26 @@ async function waitForThreadsContainer(session, id, accessToken) {
     await new Promise((resolve) => setTimeout(resolve, 1500))
   }
   throw new Error('Threadsの画像の処理が時間内に終わりませんでした。')
+}
+
+// Threadsは「コンテナ作成」→「公開」の2段階で投稿する。画像が2枚以上ならカルーセルにする(今すぐ投稿と予約投稿で共通)
+// 本文とタグ(caption)は、カルーセルなら全体のコンテナにだけ付ける
+async function threadsPublish(session, accessToken, caption, imageUrls) {
+  const create = (params) => threadsFetch(session, `/v1.0/me/threads?${new URLSearchParams(params)}`, accessToken, { method: 'POST' })
+  let container
+  if (imageUrls.length === 0) {
+    container = await create({ media_type: 'TEXT', ...caption })
+  } else if (imageUrls.length === 1) {
+    container = await create({ media_type: 'IMAGE', image_url: imageUrls[0], ...caption })
+    await waitForThreadsContainer(session, container.id, accessToken)
+  } else {
+    const items = []
+    for (const imageUrl of imageUrls) items.push(await create({ media_type: 'IMAGE', image_url: imageUrl, is_carousel_item: 'true' }))
+    for (const item of items) await waitForThreadsContainer(session, item.id, accessToken)
+    container = await create({ media_type: 'CAROUSEL', children: items.map((item) => item.id).join(','), ...caption })
+    await waitForThreadsContainer(session, container.id, accessToken)
+  }
+  return (await threadsFetch(session, `/v1.0/me/threads_publish?creation_id=${container.id}`, accessToken, { method: 'POST' })).id
 }
 
 async function threadsCreatePost(request, env, session) {
@@ -447,29 +493,16 @@ async function threadsCreatePost(request, env, session) {
   // 本文とタグは、カルーセルなら全体のコンテナにだけ付ける
   const caption = { ...(text ? { text } : {}), ...(topic.tag ? { topic_tag: topic.tag } : {}) }
   const origin = new URL(request.url).origin
-  // localhost の画像は Meta から取りに来られない
-  if (body.images.length && /^https?:\/\/(localhost|127\.0\.0\.1)(:|$)/.test(origin)) return json({ error: 'Threadsへの画像付き投稿は本番環境でのみ使えます(Metaがlocalhostの画像を取得できないため)。' }, 400)
+  if (body.images.length && isLocalOrigin(origin)) return json({ error: localImageError }, 400)
+  const mediaIds = []
   try {
-    // Threadsは「コンテナ作成」→「公開」の2段階で投稿する。画像が2枚以上ならカルーセルにする
-    const create = (params) => threadsFetch(session, `/v1.0/me/threads?${new URLSearchParams(params)}`, threads.accessToken, { method: 'POST' })
-    const imageUrls = await Promise.all(body.images.map(async (image) => `${origin}/api/media/${await storeMedia(env, image)}`))
-    let container
-    if (imageUrls.length === 0) {
-      container = await create({ media_type: 'TEXT', ...caption })
-    } else if (imageUrls.length === 1) {
-      container = await create({ media_type: 'IMAGE', image_url: imageUrls[0], ...caption })
-      await waitForThreadsContainer(session, container.id, threads.accessToken)
-    } else {
-      const items = []
-      for (const imageUrl of imageUrls) items.push(await create({ media_type: 'IMAGE', image_url: imageUrl, is_carousel_item: 'true' }))
-      for (const item of items) await waitForThreadsContainer(session, item.id, threads.accessToken)
-      container = await create({ media_type: 'CAROUSEL', children: items.map((item) => item.id).join(','), ...caption })
-      await waitForThreadsContainer(session, container.id, threads.accessToken)
-    }
-    const published = await threadsFetch(session, `/v1.0/me/threads_publish?creation_id=${container.id}`, threads.accessToken, { method: 'POST' })
-    return json({ id: published.id, text })
+    for (const image of body.images) mediaIds.push(await storeMedia(env, image))
+    return json({ id: await threadsPublish(session, threads.accessToken, caption, mediaIds.map((id) => mediaUrl(origin, id))), text })
   } catch (publishError) {
     return threadsError(publishError, 'Threadsへの投稿に失敗しました。')
+  } finally {
+    // 公開まで終われば Meta は画像を取り込み済み
+    await deleteMedia(env, mediaIds)
   }
 }
 
@@ -546,6 +579,9 @@ const schema = [
   "CREATE TABLE IF NOT EXISTS scheduled_posts (id TEXT PRIMARY KEY, platform TEXT NOT NULL, account_id TEXT NOT NULL, account_username TEXT, text TEXT NOT NULL, topic_tag TEXT, scheduled_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', posted_id TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
   'CREATE INDEX IF NOT EXISTS scheduled_posts_due ON scheduled_posts (status, scheduled_at)',
 ]
+// あとから足した列(すでにあるテーブルには ALTER TABLE で追加する)
+// images: 予約の画像 { origin, ids }(JSON)。画像は R2 の media/{ID}。origin は Threads に渡す URL を作るため
+const addedColumns = { scheduled_posts: { images: 'TEXT' } }
 // マイグレーションのコマンドを使わずに済むよう、Worker が起動して最初に使うときにテーブルを作る
 let schemaReady = false
 const scheduleMaxPerRun = 10
@@ -560,6 +596,12 @@ async function ensureSchema(env) {
   }
   if (schemaReady) return
   await env.DB.batch(schema.map((sql) => env.DB.prepare(sql)))
+  for (const [table, columns] of Object.entries(addedColumns)) {
+    const { results } = await env.DB.prepare(`PRAGMA table_info(${table})`).all()
+    for (const [column, type] of Object.entries(columns)) {
+      if (!results.some((item) => item.name === column)) await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`).run()
+    }
+  }
   schemaReady = true
 }
 
@@ -570,8 +612,16 @@ async function saveAccount(env, platform, account, overwrite) {
     .bind(platform, account.userId, account.username || '', account.accessToken, account.refreshToken || null, account.expiresAt || null, new Date().toISOString()).run()
 }
 
+function scheduleImages(row) {
+  try {
+    return row.images ? JSON.parse(row.images) : null
+  } catch {
+    return null
+  }
+}
+
 function scheduleItem(row) {
-  return { id: row.id, platform: row.platform, accountId: row.account_id, accountUsername: row.account_username || '', text: row.text, topicTag: row.topic_tag || '', scheduledAt: row.scheduled_at, status: row.status, postedId: row.posted_id || '', error: row.error || '', createdAt: row.created_at, updatedAt: row.updated_at }
+  return { id: row.id, platform: row.platform, accountId: row.account_id, accountUsername: row.account_username || '', text: row.text, topicTag: row.topic_tag || '', imageCount: scheduleImages(row)?.ids.length || 0, scheduledAt: row.scheduled_at, status: row.status, postedId: row.posted_id || '', error: row.error || '', createdAt: row.created_at, updatedAt: row.updated_at }
 }
 
 async function listSchedules(env) {
@@ -581,13 +631,15 @@ async function listSchedules(env) {
 }
 
 async function createSchedule(request, env, session) {
-  const body = await request.json().catch(() => null)
+  const body = await readPostBody(request)
   const platform = body?.platform
   const account = platform === 'x' ? session.data : platform === 'threads' ? session.data.threads : null
   if (!account?.accessToken) return json({ error: '予約するにはアカウントを連携してください。' }, 401)
   if (!account.userId) return json({ error: 'アカウント情報が足りません。連携し直してください。' }, 400)
-  const { text, error } = validatePost({ text: body.text, images: [] }, platform === 'x' ? 280 : 500)
+  const { text, error } = validatePost(body, platform === 'x' ? 280 : 500)
   if (error) return error
+  const origin = new URL(request.url).origin
+  if (platform === 'threads' && body.images.length && isLocalOrigin(origin)) return json({ error: localImageError }, 400)
   const topic = platform === 'threads' ? validateTopicTag(body.topicTag) : { tag: '' }
   if (topic.error) return topic.error
   const scheduledAt = new Date(body.scheduledAt)
@@ -596,17 +648,26 @@ async function createSchedule(request, env, session) {
   const overdue = scheduledAt <= new Date()
   if (overdue && !body.migrated) return json({ error: '予約日時は現在より後の日時を指定してください。' }, 400)
   await saveAccount(env, platform, account, false)
-  const now = new Date().toISOString()
-  const row = { id: randomHex(16), platform, account_id: account.userId, account_username: account.username || '', text, topic_tag: topic.tag, scheduled_at: scheduledAt.toISOString(), status: overdue ? 'failed' : 'pending', posted_id: null, error: overdue ? '自動投稿を始める前に予定時刻を過ぎていました。' : null, created_at: now, updated_at: now }
-  await env.DB.prepare('INSERT INTO scheduled_posts (id, platform, account_id, account_username, text, topic_tag, scheduled_at, status, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .bind(row.id, row.platform, row.account_id, row.account_username, row.text, row.topic_tag, row.scheduled_at, row.status, row.error, row.created_at, row.updated_at).run()
-  return json({ schedule: scheduleItem(row) })
+  const mediaIds = []
+  try {
+    for (const image of body.images) mediaIds.push(await storeMedia(env, image))
+    const now = new Date().toISOString()
+    const row = { id: randomHex(16), platform, account_id: account.userId, account_username: account.username || '', text, topic_tag: topic.tag, images: mediaIds.length ? JSON.stringify({ origin, ids: mediaIds }) : null, scheduled_at: scheduledAt.toISOString(), status: overdue ? 'failed' : 'pending', posted_id: null, error: overdue ? '自動投稿を始める前に予定時刻を過ぎていました。' : null, created_at: now, updated_at: now }
+    await env.DB.prepare('INSERT INTO scheduled_posts (id, platform, account_id, account_username, text, topic_tag, images, scheduled_at, status, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(row.id, row.platform, row.account_id, row.account_username, row.text, row.topic_tag, row.images, row.scheduled_at, row.status, row.error, row.created_at, row.updated_at).run()
+    return json({ schedule: scheduleItem(row) })
+  } catch (scheduleError) {
+    // 予約を保存できなければ、先に保存した画像を消す
+    await deleteMedia(env, mediaIds)
+    throw scheduleError
+  }
 }
 
 async function deleteSchedule(env, id) {
   await ensureSchema(env)
-  const result = await env.DB.prepare("DELETE FROM scheduled_posts WHERE id = ? AND status != 'posting'").bind(id).run()
-  if (!result.meta.changes && await env.DB.prepare('SELECT id FROM scheduled_posts WHERE id = ?').bind(id).first()) return json({ error: '投稿中のため削除できません。少し待ってから更新してください。' }, 409)
+  const deleted = await env.DB.prepare("DELETE FROM scheduled_posts WHERE id = ? AND status != 'posting' RETURNING images").bind(id).first()
+  if (!deleted && await env.DB.prepare('SELECT id FROM scheduled_posts WHERE id = ?').bind(id).first()) return json({ error: '投稿中のため削除できません。少し待ってから更新してください。' }, 409)
+  if (deleted) await deleteMedia(env, scheduleImages(deleted)?.ids || [])
   return json({ deleted: true })
 }
 
@@ -637,18 +698,23 @@ async function threadsAccessToken(env, session, account) {
   }
 }
 
-// 予約は本文(とThreadsのタグ)だけ。画像は保存しない
+// 画像は R2 にあり、X へは R2 から読んでアップロードし、Threads へは /api/media/{ID} の URL を渡す
 async function publishSchedule(env, row) {
   const account = await env.DB.prepare('SELECT * FROM accounts WHERE platform = ? AND user_id = ?').bind(row.platform, row.account_id).first()
   if (!account) throw new Error(`@${row.account_username} の連携情報がありません。このアカウントを連携し直してから「今すぐ投稿」を押してください。`)
-  if (row.platform === 'x') return (await xTweet(await xAccessToken(env, account), { text: row.text })).id
+  const media = scheduleImages(row)
+  if (row.platform === 'x') {
+    const accessToken = await xAccessToken(env, account)
+    const tweet = row.text ? { text: row.text } : {}
+    if (media) tweet.media = { media_ids: await Promise.all(media.ids.map(async (id) => xUploadImage(await loadMedia(env, id), accessToken))) }
+    return (await xTweet(accessToken, tweet)).id
+  }
   // API利用状況の画面の呼び出し回数にも数える
   const session = { data: { threads: { userId: account.user_id } } }
   try {
     const accessToken = await threadsAccessToken(env, session, account)
-    const params = new URLSearchParams({ media_type: 'TEXT', text: row.text, ...(row.topic_tag ? { topic_tag: row.topic_tag } : {}) })
-    const container = await threadsFetch(session, `/v1.0/me/threads?${params}`, accessToken, { method: 'POST' })
-    return (await threadsFetch(session, `/v1.0/me/threads_publish?creation_id=${container.id}`, accessToken, { method: 'POST' })).id
+    const caption = { ...(row.text ? { text: row.text } : {}), ...(row.topic_tag ? { topic_tag: row.topic_tag } : {}) }
+    return await threadsPublish(session, accessToken, caption, media ? media.ids.map((id) => mediaUrl(media.origin, id)) : [])
   } finally {
     await saveThreadsCalls(session, env).catch((saveError) => console.error(saveError))
   }
@@ -668,6 +734,8 @@ async function runSchedule(env, id, fromStatuses) {
   }
   const updatedAt = new Date().toISOString()
   await env.DB.prepare('UPDATE scheduled_posts SET status = ?, posted_id = ?, error = ?, updated_at = ? WHERE id = ?').bind(result.status, result.posted_id, result.error, updatedAt, id).run()
+  // 投稿できた画像は消す(失敗したものは「もう一度投稿」のために残す)
+  if (result.status === 'posted') await deleteMedia(env, scheduleImages(claimed)?.ids || [])
   return { ...claimed, ...result, updated_at: updatedAt }
 }
 
@@ -689,9 +757,17 @@ async function runDueSchedules(env) {
     env.DB.prepare("UPDATE scheduled_posts SET status = 'failed', error = ?, updated_at = ? WHERE status = 'posting' AND updated_at < ?").bind('投稿の途中で止まりました。投稿されたかどうかをSNSで確認してください。', new Date(now).toISOString(), new Date(now - stuckMs).toISOString()),
     // 投稿済みは7日で一覧から消す
     env.DB.prepare("DELETE FROM scheduled_posts WHERE status = 'posted' AND updated_at < ?").bind(new Date(now - postedKeepMs).toISOString()),
-    env.DB.prepare("SELECT id FROM scheduled_posts WHERE status = 'pending' AND scheduled_at <= ? ORDER BY scheduled_at LIMIT ?").bind(new Date(now).toISOString(), scheduleMaxPerRun),
+    env.DB.prepare("SELECT id, images FROM scheduled_posts WHERE status = 'pending' AND scheduled_at <= ? ORDER BY scheduled_at LIMIT ?").bind(new Date(now).toISOString(), scheduleMaxPerRun),
   ])
-  for (const row of due.results) await runSchedule(env, row.id, ['pending'])
+  // 画像付きは Threads の処理待ちで呼び出しが多い(1回の実行で外部の呼び出しは50回まで)ため、1回に1件だけ。残りは次の分に投稿する
+  let hasPostedImages = false
+  for (const row of due.results) {
+    if (row.images) {
+      if (hasPostedImages) continue
+      hasPostedImages = true
+    }
+    await runSchedule(env, row.id, ['pending'])
+  }
 }
 
 async function handleSchedule(handler) {

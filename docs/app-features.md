@@ -49,7 +49,7 @@
                                status: posted(投稿済み)/ failed(投稿できませんでした)
 ```
 
-- 予約できるのは**本文と Threads のトピックタグだけ**。画像は予約できない(保存しない)。
+- 本文・Threads のトピックタグ・**画像(4枚まで)**を予約できる。画像は **R2** に保存する(下の「予約の画像」)。
 - 投稿は予定時刻から**1分ほど遅れる**ことがある(毎分の実行のため)。1回の実行で投稿するのは10件まで。残りは次の分に投稿する。
 - 予約は D1 にあるので、**別のブラウザ・スマホでも同じ予約が見える**。ただし開発(`wrangler dev`)の D1 は PC 上の仮のもので、本番とは別。
 
@@ -124,7 +124,23 @@ curl "http://127.0.0.1:8787/cdn-cgi/handler/scheduled?cron=*+*+*+*+*"
 | Workers のリクエスト | 毎分1回(1日1,440回) | 1日10万回 |
 | D1 | 毎分 SQL 3つ。書き込みは予約・投稿のときだけ | 読み込み1日500万行、書き込み1日10万行 |
 
-テーブルは Worker が最初に使うときに作る(`ensureSchema`)。マイグレーションのコマンドは不要。
+テーブルは Worker が最初に使うときに作る(`ensureSchema`)。マイグレーションのコマンドは不要。あとから足した列(`images`)は、すでにあるテーブルに `ALTER TABLE` で追加する(`addedColumns`)。
+
+### 予約の画像
+
+```text
+「予約投稿」(画像あり)→ multipart/form-data で POST /api/schedules
+  → 画像を R2 の media/{ID} に保存し、D1 の images に { origin, ids } を記録
+予定時刻 → X:       R2 から読んで POST /2/media/upload → 投稿に付ける
+           Threads: {origin}/api/media/{ID} の URL を渡す(Meta が取りに来る)
+投稿済み → R2 の画像を消す
+```
+
+- 画像の保存先は **R2(`MEDIA`、バケット名 `sns-posting-media`)**。KV より保存できる量が多く(無料で10GB)、期限を気にせず予定時刻まで置いておける。
+- R2 には自動で消える期限がないため、**投稿できたとき・予約を削除したときに消す**。「投稿できませんでした」の予約は、「もう一度投稿」のために残す。
+- 画像付きの予約は、1回の実行で**1件だけ**投稿する。Threads は画像の処理を待つ間に何度も API を呼ぶため、1回の実行で外部を呼べる上限(50回)を超えないようにしている。残りは次の分に投稿する。
+- Threads の画像付きの予約は、今すぐ投稿と同じく**開発環境(localhost)ではできない**。
+- 一覧には画像の枚数を表示する。
 
 ## 4. 下書き
 
@@ -176,7 +192,8 @@ curl "http://127.0.0.1:8787/cdn-cgi/handler/scheduled?cron=*+*+*+*+*"
 - JPEG・PNG、1枚5MBまで、**4枚まで**(X と Threads の両方で使える範囲)。値は [src/App.jsx](../src/App.jsx) と [worker/index.js](../worker/index.js) の `maxImages`・`maxImageBytes`・`imageTypes`。変えるときはそろえる。
 - 画像があるときは、画面から Worker へ `multipart/form-data`(`text`、`accountId`、`topicTag`、`images`)で送る。テキストだけなら今までどおり JSON。
 - 画像だけの投稿もできる(本文は空でよい)。
-- **下書き・予約には画像を保存しない**(localStorage に入りきらないため)。保存すると「画像は保存されません」と表示する。
+- **下書きには画像を保存しない**(localStorage に入りきらないため)。保存すると「画像は保存されません」と表示する。
+- **予約には画像も保存する**(R2。3章の「予約の画像」)。
 
 ### X
 
@@ -185,11 +202,12 @@ curl "http://127.0.0.1:8787/cdn-cgi/handler/scheduled?cron=*+*+*+*+*"
 
 ### Threads
 
-- Threads は画像を URL で受け取り、Meta のサーバーがその URL から画像を取りに来る。そのため Worker が画像を **KV に1時間だけ保存**し、`/api/media/{ランダムな32文字}` で返す。
+- Threads は画像を URL で受け取り、Meta のサーバーがその URL から画像を取りに来る。そのため Worker が画像を **R2(`MEDIA`)に保存**し、`/api/media/{ランダムな32文字}` で返す。今すぐ投稿の画像は、公開し終わったら消す。
 - 1枚なら `IMAGE`、2枚以上なら `CAROUSEL`(各画像のコンテナ → まとめるコンテナ → 公開)。Meta が画像を取り込むまで公開できないため、コンテナの `status` が `FINISHED` になるまで待つ(最大10回、1.5秒おき)。
-- `/api/media/*` はセッションを作らない(Meta のアクセスで KV の書き込みを増やさないため)。画像1枚につき KV の書き込みは1回。
+- `/api/media/*` はセッションを作らない(Meta のアクセスで KV の書き込みを増やさないため)。画像1枚につき R2 の書き込み1回・削除1回。
+- 以前は KV に1時間だけ保存していた。予約の画像を予定時刻まで置いておくため、R2 にそろえた。
 - **開発環境(localhost)では使えない**。Meta から localhost に届かないため、Worker がエラーを返す。
-- **本番では Cloudflare Access の Bypass が必要**。サイト全体が Access で守られているため、そのままでは Meta が画像を取りに来られず投稿に失敗する。Zero Trust でアプリケーションを追加し、パス `sns-posting.tryoma0227.workers.dev/api/media/*` に **Bypass(Everyone)** のポリシーを付ける。URL はランダムで1時間で消えるため、公開しても推測されにくい。
+- **本番では Cloudflare Access の Bypass が必要**。サイト全体が Access で守られているため、そのままでは Meta が画像を取りに来られず投稿に失敗する。Zero Trust でアプリケーションを追加し、パス `sns-posting.tryoma0227.workers.dev/api/media/*` に **Bypass(Everyone)** のポリシーを付ける。URL はランダムで、投稿し終わると消えるため、公開しても推測されにくい(予約の画像は予定時刻まで残る)。
 
 ## 8. ハッシュタグ・トピックタグ
 

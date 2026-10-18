@@ -117,6 +117,15 @@ OAuth のコールバックは HTTPS が前提のため、「HTTPS を自分で�
 - Cron は Cloudflare の中から Worker を呼ぶため、**Cloudflare Access を通らない**。Bypass の設定は不要。
 - 仕組みは [app-features.md](app-features.md) の3章。
 
+### R2(画像の保存先)
+
+画像(Threads に渡す画像、予約投稿の画像)の保存先として、`r2_buckets`(`MEDIA`、バケット名 `sns-posting-media`)を追加した。
+
+- **R2 は、アカウントで一度有効にしないと使えない**。有効にしないまま push すると、デプロイが失敗する。
+- 有効にする場所: ダッシュボードの **Storage & Databases → R2 Object Storage**。有効にするときに**支払い方法(クレジットカードなど)の登録が必要**。無料枠(保存 10GB、書き込み 月100万回、読み込み 月1,000万回、転送量は無料)の中なら請求はない。
+- バケットは、有効にしたあとで `npx wrangler r2 bucket create sns-posting-media` を実行するか、ダッシュボードの「バケットを作成」で作る。
+- バケットは**公開しない**(パブリックアクセスや r2.dev の URL は不要)。画像は Worker の `/api/media/*` から返す。
+
 ### 確認方法
 
 ```text

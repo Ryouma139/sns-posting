@@ -13,6 +13,8 @@
   "kv_namespaces": [{ "binding": "SESSIONS" }],
   // 予約投稿と、予約投稿に使うトークンの保存用。KV と同じく id を省略すると初回デプロイ時に自動作成される
   "d1_databases": [{ "binding": "DB", "database_name": "sns-posting" }],
+  // 画像(Threads に渡す画像、予約投稿の画像)の保存用。R2 を有効にしてからデプロイする
+  "r2_buckets": [{ "binding": "MEDIA", "bucket_name": "sns-posting-media" }],
   // 毎分、予定時刻を過ぎた予約を投稿する(worker/index.js の scheduled)
   "triggers": { "crons": ["* * * * *"] },
   "observability": { "enabled": true }

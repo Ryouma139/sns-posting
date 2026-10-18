@@ -604,14 +604,23 @@ function App() {
   const handleSchedule = async (event) => {
     event.preventDefault()
     const scheduledAt = new Date(scheduleAt)
-    if (!post.trim() || isOverLimit || isScheduling || Number.isNaN(scheduledAt.getTime())) return
+    if ((!post.trim() && images.length === 0) || isOverLimit || isScheduling || Number.isNaN(scheduledAt.getTime())) return
     if (scheduledAt <= new Date()) { showError('予約日時は現在より後の日時を指定してください。'); return }
     if (!isConnected) { showError(`予約するには${platformInfo.label}アカウントを連携してください。`); return }
     // Worker が連携中のアカウントを予約に記録し、予定時刻にそのアカウントで投稿する
+    // 画像があるときは今すぐ投稿と同じく multipart/form-data で送る(画像は Worker が R2 に保存する)
+    const fields = { platform, text: post.trim(), topicTag: platform === 'threads' ? topicTag.trim().replace(/^#+/, '') : '', scheduledAt: scheduledAt.toISOString() }
+    let request = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(fields) }
+    if (images.length) {
+      const form = new FormData()
+      for (const [key, value] of Object.entries(fields)) form.append(key, value)
+      for (const item of images) form.append('images', item.file)
+      request = { method: 'POST', body: form }
+    }
     setIsScheduling(true)
     let item
     try {
-      const response = await fetch('/api/schedules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ platform, text: post.trim(), topicTag: platform === 'threads' ? topicTag.trim().replace(/^#+/, '') : '', scheduledAt: scheduledAt.toISOString() }) })
+      const response = await fetch('/api/schedules', request)
       const result = await response.json()
       if (!response.ok) throw new Error(result.error || `エラー ${response.status}`)
       item = result.schedule
@@ -628,8 +637,8 @@ function App() {
     clearImages()
     finishEditingDraft()
     setIsNoticeError(false)
-    setNotice(`${formatScheduledAt(item.scheduledAt)} に予約しました${imageNotSavedNote}`)
-    addNotification('info', `${platformInfo.label}の予約投稿を追加しました`, `${formatScheduledAt(item.scheduledAt)} · ${item.text}`)
+    setNotice(`${formatScheduledAt(item.scheduledAt)} に予約しました`)
+    addNotification('info', `${platformInfo.label}の予約投稿を追加しました`, [formatScheduledAt(item.scheduledAt), item.text, item.imageCount ? `画像${item.imageCount}枚` : ''].filter(Boolean).join(' · '))
     window.setTimeout(() => setNotice(''), 3000)
   }
 
@@ -701,7 +710,7 @@ function App() {
       <div className={`upcoming-row archive-row${item.status === 'posted' ? ' posted-row' : ''}`} key={item.id}>
         <div className="date-block"><b>{date.getDate()}</b><span>{date.getMonth() + 1}月</span></div>
         <div className="upcoming-content">
-          <div className="upcoming-meta">{scheduleStatusPill(item)}{item.topicTag && <span className="draft-pill account-pill-small">#{item.topicTag}</span>}{showAccount && <span className="draft-pill account-pill-small">{item.accountUsername ? `@${item.accountUsername}` : 'アカウント不明'}</span>}<span>{formatScheduledAt(item.scheduledAt)}{item.status === 'posted' && item.updatedAt ? ` · ${formatScheduledAt(item.updatedAt)} に投稿` : ''}</span></div>
+          <div className="upcoming-meta">{scheduleStatusPill(item)}{item.topicTag && <span className="draft-pill account-pill-small">#{item.topicTag}</span>}{item.imageCount > 0 && <span className="draft-pill account-pill-small"><Image size={12} /> {item.imageCount}枚</span>}{showAccount && <span className="draft-pill account-pill-small">{item.accountUsername ? `@${item.accountUsername}` : 'アカウント不明'}</span>}<span>{formatScheduledAt(item.scheduledAt)}{item.status === 'posted' && item.updatedAt ? ` · ${formatScheduledAt(item.updatedAt)} に投稿` : ''}</span></div>
           <p>{item.text}</p>
           {item.status === 'failed' && item.error && <p className="schedule-error">{item.error}</p>}
         </div>
@@ -837,11 +846,11 @@ function App() {
                 <ul className="attachment-grid" aria-label="添付画像">
                   {images.map((item) => <li key={item.id}><img src={item.url} alt={item.file.name} /><button type="button" onClick={() => removeImage(item.id)} aria-label={`${item.file.name} を削除`} title="画像を削除"><X size={14} /></button></li>)}
                 </ul>
-              )}<div className="composer-footer"><div className="format-actions"><input ref={imageInputRef} type="file" accept={imageTypes.join(',')} multiple hidden onChange={handleSelectImages} /><button type="button" aria-label="画像を追加" title={images.length >= maxImages ? `画像は${maxImages}枚までです` : `画像を追加(JPEG・PNG、5MBまで、${maxImages}枚まで)`} disabled={images.length >= maxImages} onClick={() => imageInputRef.current?.click()}><Image size={19} />{images.length > 0 && <span className="attachment-count">{images.length}</span>}</button><button type="button" aria-label="ファイルを添付" title="画像ファイルを添付" disabled={images.length >= maxImages} onClick={() => imageInputRef.current?.click()}><Paperclip size={19} /></button><button type="button" aria-label="ハッシュタグを追加" title={platform === 'threads' ? 'トピックタグを入力' : '本文に「#」を入れる'} onClick={handleHashButton}><Hash size={19} /></button><button aria-label="投稿を削除"><Trash2 size={18} /></button></div><div className="character-count"><span className={post.length > maxCharacters - 30 ? 'near-limit' : ''}>{post.length}</span> / {maxCharacters}<button className="schedule-button draft-save-button" disabled={!post.trim()} onClick={handleSaveDraft}><FileText size={16} /> 下書き保存</button><span className="schedule-wrap"><button className="schedule-button" disabled={!post.trim() || isOverLimit || Boolean(topicTagError)} aria-expanded={isScheduleOpen} onClick={() => isScheduleOpen ? setIsScheduleOpen(false) : openSchedule()}><Clock3 size={16} /> 予約投稿</button>{isScheduleOpen && (
+              )}<div className="composer-footer"><div className="format-actions"><input ref={imageInputRef} type="file" accept={imageTypes.join(',')} multiple hidden onChange={handleSelectImages} /><button type="button" aria-label="画像を追加" title={images.length >= maxImages ? `画像は${maxImages}枚までです` : `画像を追加(JPEG・PNG、5MBまで、${maxImages}枚まで)`} disabled={images.length >= maxImages} onClick={() => imageInputRef.current?.click()}><Image size={19} />{images.length > 0 && <span className="attachment-count">{images.length}</span>}</button><button type="button" aria-label="ファイルを添付" title="画像ファイルを添付" disabled={images.length >= maxImages} onClick={() => imageInputRef.current?.click()}><Paperclip size={19} /></button><button type="button" aria-label="ハッシュタグを追加" title={platform === 'threads' ? 'トピックタグを入力' : '本文に「#」を入れる'} onClick={handleHashButton}><Hash size={19} /></button><button aria-label="投稿を削除"><Trash2 size={18} /></button></div><div className="character-count"><span className={post.length > maxCharacters - 30 ? 'near-limit' : ''}>{post.length}</span> / {maxCharacters}<button className="schedule-button draft-save-button" disabled={!post.trim()} onClick={handleSaveDraft}><FileText size={16} /> 下書き保存</button><span className="schedule-wrap"><button className="schedule-button" disabled={(!post.trim() && images.length === 0) || isOverLimit || Boolean(topicTagError)} aria-expanded={isScheduleOpen} onClick={() => isScheduleOpen ? setIsScheduleOpen(false) : openSchedule()}><Clock3 size={16} /> 予約投稿</button>{isScheduleOpen && (
                 <form className="schedule-popover" onSubmit={handleSchedule}>
                   <label htmlFor="schedule-at">投稿する日時</label>
                   <input id="schedule-at" type="datetime-local" value={scheduleAt} min={toLocalInputValue(new Date())} onChange={(event) => setScheduleAt(event.target.value)} required />
-                  <p>予定時刻になると自動で投稿されます(1分ほど遅れることがあります)。画像は予約できません。</p>
+                  <p>予定時刻になると自動で投稿されます(1分ほど遅れることがあります)。画像も一緒に投稿されます。</p>
                   <div><button type="button" className="outline-button" onClick={() => setIsScheduleOpen(false)}>キャンセル</button><button type="submit" className="post-button" disabled={!scheduleAt || isScheduling}>{isScheduling ? '予約中...' : '予約する'}</button></div>
                 </form>
               )}</span><button className="post-button" disabled={!isConnected || (!post.trim() && images.length === 0) || isOverLimit || Boolean(topicTagError) || isPosting} onClick={handlePost}><Send size={16} /> {isPosting ? '投稿中...' : '今すぐ投稿'}</button></div></div></div><aside className="preview-card"><div className="preview-label"><span>プレビュー</span><span className="live-dot">LIVE</span></div><div className="preview-post"><div className="preview-user"><span className="avatar peach">{initial}</span><div><b>{isConnected ? displayName : 'あなたのアカウント'}</b><span>@{isConnected ? username : 'username'} · 今</span></div><span className="preview-x">{platformInfo.symbol}</span></div><p>{post || (images.length ? '' : '入力した投稿内容がここに表示されます。')}</p>{platform === 'threads' && cleanTopicTag && !topicTagError && <span className="preview-topic-tag"><Hash size={12} />{cleanTopicTag}</span>}{images.length > 0 && <div className={`preview-images count-${images.length}`}>{images.map((item) => <img key={item.id} src={item.url} alt="" />)}</div>}<div className="preview-actions"><span>♡ 0</span><span>↻ 0</span><span>♧ 0</span><MoreHorizontal size={15} /></div></div><div className="preview-tip"><Sparkles size={15} /><span><b>印象に残る投稿に</b><br />短く、わかりやすく、あなたらしく。</span></div></aside></section>
