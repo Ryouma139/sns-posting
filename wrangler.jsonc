@@ -11,5 +11,9 @@
   },
   // セッション保存用。id を省略すると初回デプロイ時に自動作成される
   "kv_namespaces": [{ "binding": "SESSIONS" }],
+  // 予約投稿と、予約投稿に使うトークンの保存用。KV と同じく id を省略すると初回デプロイ時に自動作成される
+  "d1_databases": [{ "binding": "DB", "database_name": "sns-posting" }],
+  // 毎分、予定時刻を過ぎた予約を投稿する(worker/index.js の scheduled)
+  "triggers": { "crons": ["* * * * *"] },
   "observability": { "enabled": true }
 }

@@ -1,5 +1,6 @@
 // Cloudflare Workers 用 API。画面(dist)は静的アセットとして配信し、/api/* だけをこの Worker で処理する
 // セッションは KV(SESSIONS) に保存し、OAuth の state などは短命の Cookie に保存する
+// 予約投稿は D1(DB) に保存し、Cron Trigger(scheduled)で投稿する
 
 const threadsGraph = 'https://graph.threads.net'
 const sessionTtl = 86400
@@ -90,15 +91,19 @@ async function xConnect(request, env) {
   return startOAuth(`https://x.com/i/oauth2/authorize?${params}`, { provider: 'x', state, codeVerifier })
 }
 
+function xTokenHeaders(env) {
+  const headers = { 'Content-Type': 'application/x-www-form-urlencoded' }
+  // Confidential client(Web App)ではClient Secretを使ったBasic認証が必要
+  if (env.X_CLIENT_SECRET) headers.Authorization = `Basic ${btoa(`${env.X_CLIENT_ID}:${env.X_CLIENT_SECRET}`)}`
+  return headers
+}
+
 async function xCallback(request, env, session, url) {
   const code = url.searchParams.get('code')
   const oauth = readOAuth(request, url.searchParams.get('state'), 'x')
   if (url.searchParams.get('error') || !code || !oauth) return clearOAuth(redirect('/?x_error=oauth'))
   try {
-    const tokenHeaders = { 'Content-Type': 'application/x-www-form-urlencoded' }
-    // Confidential client(Web App)ではClient Secretを使ったBasic認証が必要
-    if (env.X_CLIENT_SECRET) tokenHeaders.Authorization = `Basic ${btoa(`${env.X_CLIENT_ID}:${env.X_CLIENT_SECRET}`)}`
-    const tokenResponse = await fetch('https://api.x.com/2/oauth2/token', { method: 'POST', headers: tokenHeaders, body: new URLSearchParams({ code, grant_type: 'authorization_code', client_id: env.X_CLIENT_ID, redirect_uri: redirectUri(env, request, 'X_REDIRECT_URI', 'x'), code_verifier: oauth.codeVerifier }) })
+    const tokenResponse = await fetch('https://api.x.com/2/oauth2/token', { method: 'POST', headers: xTokenHeaders(env), body: new URLSearchParams({ code, grant_type: 'authorization_code', client_id: env.X_CLIENT_ID, redirect_uri: redirectUri(env, request, 'X_REDIRECT_URI', 'x'), code_verifier: oauth.codeVerifier }) })
     const token = await tokenResponse.json()
     if (!tokenResponse.ok) throw new Error(token.error_description || 'X token exchange failed')
     // 連携時の1回の呼び出しでプロフィールもまとめて取得する
@@ -121,6 +126,8 @@ async function xCallback(request, env, session, url) {
       } : null,
     })
     session.dirty = true
+    // 予約投稿はセッションが切れても投稿できるよう、トークンをアカウントごとに DB にも保存する
+    if (session.data.userId) await saveAccount(env, 'x', { ...session.data, expiresAt: token.expires_in ? Date.now() + token.expires_in * 1000 : null }, true).catch((saveError) => console.error(saveError))
     return clearOAuth(redirect('/?x_connected=1'))
   } catch (callbackError) {
     console.error(callbackError)
@@ -218,14 +225,23 @@ async function xCreatePost(request, session) {
   try {
     // 画像は先にアップロードし、返ってきた media_id を投稿に付ける(アップロードもクレジットを消費する)
     if (body.images.length) tweet.media = { media_ids: await Promise.all(body.images.map((image) => xUploadImage(image, session.data.accessToken))) }
-  } catch (uploadError) {
-    console.error(uploadError)
-    return json({ error: uploadError.message }, uploadError.status || 500)
+    const posted = await xTweet(session.data.accessToken, tweet)
+    return json({ id: posted.id, text: posted.text || text })
+  } catch (postError) {
+    console.error(postError)
+    return json({ error: postError.message }, postError.status || 500)
   }
-  const xResponse = await fetch('https://api.x.com/2/tweets', { method: 'POST', headers: { Authorization: `Bearer ${session.data.accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify(tweet) })
-  const result = await xResponse.json()
-  if (!xResponse.ok) return json({ error: result.detail || result.title || 'Xへの投稿に失敗しました。' }, xResponse.status)
-  return json({ id: result.data.id, text: result.data.text || text })
+}
+
+async function xTweet(accessToken, tweet) {
+  const xResponse = await fetch('https://api.x.com/2/tweets', { method: 'POST', headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify(tweet) })
+  const result = await xResponse.json().catch(() => ({}))
+  if (!xResponse.ok || !result.data?.id) {
+    const error = new Error(result.detail || result.title || 'Xへの投稿に失敗しました。')
+    error.status = xResponse.ok ? 502 : xResponse.status
+    throw error
+  }
+  return result.data
 }
 
 // ---- Threads ----
@@ -347,6 +363,8 @@ async function threadsCallback(request, env, session, url) {
       profile: { imageUrl: user.threads_profile_picture_url || '', description: user.threads_biography || '', location: '', createdAt: '', verified: false, metrics: null },
     }
     session.dirty = true
+    // 予約投稿用(X と同じ)。長期トークンは約60日で切れる
+    await saveAccount(env, 'threads', { ...session.data.threads, expiresAt: longLived.expires_in ? Date.now() + longLived.expires_in * 1000 : null }, true).catch((saveError) => console.error(saveError))
     return clearOAuth(redirect('/?threads_connected=1'))
   } catch (callbackError) {
     console.error(callbackError)
@@ -519,13 +537,185 @@ async function threadsGetUsage(session, env) {
   }
 }
 
+// ---- 予約投稿(自動) ----
+// 予約は D1(DB)に保存し、Cron Trigger(毎分)で予定時刻を過ぎたものを投稿する
+// KV ではなく D1 にしたのは、書き込みがすぐ読める(二重投稿を防げる)ため。KV は反映に最大60秒かかる
+// ブラウザのセッション(24時間)が切れても投稿できるよう、投稿に使うトークンをアカウントごとに accounts に保存する
+const schema = [
+  'CREATE TABLE IF NOT EXISTS accounts (platform TEXT NOT NULL, user_id TEXT NOT NULL, username TEXT, access_token TEXT NOT NULL, refresh_token TEXT, expires_at INTEGER, updated_at TEXT NOT NULL, PRIMARY KEY (platform, user_id))',
+  "CREATE TABLE IF NOT EXISTS scheduled_posts (id TEXT PRIMARY KEY, platform TEXT NOT NULL, account_id TEXT NOT NULL, account_username TEXT, text TEXT NOT NULL, topic_tag TEXT, scheduled_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', posted_id TEXT, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+  'CREATE INDEX IF NOT EXISTS scheduled_posts_due ON scheduled_posts (status, scheduled_at)',
+]
+// マイグレーションのコマンドを使わずに済むよう、Worker が起動して最初に使うときにテーブルを作る
+let schemaReady = false
+const scheduleMaxPerRun = 10
+const stuckMs = 10 * 60 * 1000
+const postedKeepMs = 7 * 86400 * 1000
+
+async function ensureSchema(env) {
+  if (!env.DB) {
+    const error = new Error('予約投稿のデータベース(DB)が設定されていません。')
+    error.status = 503
+    throw error
+  }
+  if (schemaReady) return
+  await env.DB.batch(schema.map((sql) => env.DB.prepare(sql)))
+  schemaReady = true
+}
+
+// 連携したときは上書きし、予約したときは(DB に保存する前に連携したセッション向けに)なければ追加する
+async function saveAccount(env, platform, account, overwrite) {
+  await ensureSchema(env)
+  await env.DB.prepare(`INSERT OR ${overwrite ? 'REPLACE' : 'IGNORE'} INTO accounts (platform, user_id, username, access_token, refresh_token, expires_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .bind(platform, account.userId, account.username || '', account.accessToken, account.refreshToken || null, account.expiresAt || null, new Date().toISOString()).run()
+}
+
+function scheduleItem(row) {
+  return { id: row.id, platform: row.platform, accountId: row.account_id, accountUsername: row.account_username || '', text: row.text, topicTag: row.topic_tag || '', scheduledAt: row.scheduled_at, status: row.status, postedId: row.posted_id || '', error: row.error || '', createdAt: row.created_at, updatedAt: row.updated_at }
+}
+
+async function listSchedules(env) {
+  await ensureSchema(env)
+  const { results } = await env.DB.prepare('SELECT * FROM scheduled_posts ORDER BY scheduled_at').all()
+  return json({ schedules: results.map(scheduleItem) })
+}
+
+async function createSchedule(request, env, session) {
+  const body = await request.json().catch(() => null)
+  const platform = body?.platform
+  const account = platform === 'x' ? session.data : platform === 'threads' ? session.data.threads : null
+  if (!account?.accessToken) return json({ error: '予約するにはアカウントを連携してください。' }, 401)
+  if (!account.userId) return json({ error: 'アカウント情報が足りません。連携し直してください。' }, 400)
+  const { text, error } = validatePost({ text: body.text, images: [] }, platform === 'x' ? 280 : 500)
+  if (error) return error
+  const topic = platform === 'threads' ? validateTopicTag(body.topicTag) : { tag: '' }
+  if (topic.error) return topic.error
+  const scheduledAt = new Date(body.scheduledAt)
+  if (Number.isNaN(scheduledAt.getTime())) return json({ error: '予約日時を読み取れませんでした。' }, 400)
+  // ブラウザに保存していた予約を移すとき、予定時刻を過ぎていたものは自動では投稿せず「失敗」として残す
+  const overdue = scheduledAt <= new Date()
+  if (overdue && !body.migrated) return json({ error: '予約日時は現在より後の日時を指定してください。' }, 400)
+  await saveAccount(env, platform, account, false)
+  const now = new Date().toISOString()
+  const row = { id: randomHex(16), platform, account_id: account.userId, account_username: account.username || '', text, topic_tag: topic.tag, scheduled_at: scheduledAt.toISOString(), status: overdue ? 'failed' : 'pending', posted_id: null, error: overdue ? '自動投稿を始める前に予定時刻を過ぎていました。' : null, created_at: now, updated_at: now }
+  await env.DB.prepare('INSERT INTO scheduled_posts (id, platform, account_id, account_username, text, topic_tag, scheduled_at, status, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind(row.id, row.platform, row.account_id, row.account_username, row.text, row.topic_tag, row.scheduled_at, row.status, row.error, row.created_at, row.updated_at).run()
+  return json({ schedule: scheduleItem(row) })
+}
+
+async function deleteSchedule(env, id) {
+  await ensureSchema(env)
+  const result = await env.DB.prepare("DELETE FROM scheduled_posts WHERE id = ? AND status != 'posting'").bind(id).run()
+  if (!result.meta.changes && await env.DB.prepare('SELECT id FROM scheduled_posts WHERE id = ?').bind(id).first()) return json({ error: '投稿中のため削除できません。少し待ってから更新してください。' }, 409)
+  return json({ deleted: true })
+}
+
+// X のアクセストークンは約2時間で切れる。切れていれば refresh_token で更新する(refresh_token も新しくなる)
+async function xAccessToken(env, account) {
+  if (account.expires_at && account.expires_at > Date.now() + 60 * 1000) return account.access_token
+  if (!account.refresh_token) throw new Error('Xのトークンを更新できません。Xアカウントを連携し直してください。')
+  const tokenResponse = await fetch('https://api.x.com/2/oauth2/token', { method: 'POST', headers: xTokenHeaders(env), body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: account.refresh_token, client_id: env.X_CLIENT_ID }) })
+  const token = await tokenResponse.json().catch(() => ({}))
+  if (!tokenResponse.ok || !token.access_token) throw new Error(`Xのトークンを更新できませんでした(${token.error_description || tokenResponse.status})。Xアカウントを連携し直してください。`)
+  await env.DB.prepare("UPDATE accounts SET access_token = ?, refresh_token = ?, expires_at = ?, updated_at = ? WHERE platform = 'x' AND user_id = ?")
+    .bind(token.access_token, token.refresh_token || account.refresh_token, Date.now() + (token.expires_in || 7200) * 1000, new Date().toISOString(), account.user_id).run()
+  return token.access_token
+}
+
+// Threads の長期トークンは約60日。残りが7日を切ったら更新する(更新できなければ今のトークンで投稿する)
+async function threadsAccessToken(env, session, account) {
+  if (!account.expires_at || account.expires_at > Date.now() + 7 * 86400 * 1000) return account.access_token
+  if (account.expires_at <= Date.now()) throw new Error('Threadsのトークンの期限(約60日)が切れています。Threadsアカウントを連携し直してください。')
+  try {
+    const refreshed = await threadsFetch(session, '/refresh_access_token?grant_type=th_refresh_token', account.access_token)
+    await env.DB.prepare("UPDATE accounts SET access_token = ?, expires_at = ?, updated_at = ? WHERE platform = 'threads' AND user_id = ?")
+      .bind(refreshed.access_token, Date.now() + (refreshed.expires_in || 5184000) * 1000, new Date().toISOString(), account.user_id).run()
+    return refreshed.access_token
+  } catch (refreshError) {
+    console.error(refreshError)
+    return account.access_token
+  }
+}
+
+// 予約は本文(とThreadsのタグ)だけ。画像は保存しない
+async function publishSchedule(env, row) {
+  const account = await env.DB.prepare('SELECT * FROM accounts WHERE platform = ? AND user_id = ?').bind(row.platform, row.account_id).first()
+  if (!account) throw new Error(`@${row.account_username} の連携情報がありません。このアカウントを連携し直してから「今すぐ投稿」を押してください。`)
+  if (row.platform === 'x') return (await xTweet(await xAccessToken(env, account), { text: row.text })).id
+  // API利用状況の画面の呼び出し回数にも数える
+  const session = { data: { threads: { userId: account.user_id } } }
+  try {
+    const accessToken = await threadsAccessToken(env, session, account)
+    const params = new URLSearchParams({ media_type: 'TEXT', text: row.text, ...(row.topic_tag ? { topic_tag: row.topic_tag } : {}) })
+    const container = await threadsFetch(session, `/v1.0/me/threads?${params}`, accessToken, { method: 'POST' })
+    return (await threadsFetch(session, `/v1.0/me/threads_publish?creation_id=${container.id}`, accessToken, { method: 'POST' })).id
+  } finally {
+    await saveThreadsCalls(session, env).catch((saveError) => console.error(saveError))
+  }
+}
+
+// 二重投稿を防ぐため、先に status を posting にできたときだけ投稿する(D1 は書き込みがすぐ反映される)
+async function runSchedule(env, id, fromStatuses) {
+  const claimed = await env.DB.prepare(`UPDATE scheduled_posts SET status = 'posting', error = NULL, updated_at = ? WHERE id = ? AND status IN (${fromStatuses.map(() => '?').join(', ')}) RETURNING *`)
+    .bind(new Date().toISOString(), id, ...fromStatuses).first()
+  if (!claimed) return null
+  let result
+  try {
+    result = { status: 'posted', posted_id: String(await publishSchedule(env, claimed)), error: null }
+  } catch (postError) {
+    console.error(postError)
+    result = { status: 'failed', posted_id: null, error: postError.message || '投稿に失敗しました。' }
+  }
+  const updatedAt = new Date().toISOString()
+  await env.DB.prepare('UPDATE scheduled_posts SET status = ?, posted_id = ?, error = ?, updated_at = ? WHERE id = ?').bind(result.status, result.posted_id, result.error, updatedAt, id).run()
+  return { ...claimed, ...result, updated_at: updatedAt }
+}
+
+// 一覧の「今すぐ投稿」。予約していたアカウントのトークンで投稿する(連携中のアカウントは関係ない)
+async function postScheduleNow(env, id) {
+  await ensureSchema(env)
+  const row = await runSchedule(env, id, ['pending', 'failed'])
+  if (!row) return json({ error: 'この予約は投稿中か、すでに投稿済みです。一覧を更新してください。' }, 409)
+  const schedule = scheduleItem(row)
+  return row.status === 'posted' ? json({ schedule }) : json({ error: row.error, schedule }, 502)
+}
+
+// Cron Trigger から毎分呼ばれる
+async function runDueSchedules(env) {
+  await ensureSchema(env)
+  const now = Date.now()
+  const [, , due] = await env.DB.batch([
+    // 投稿の途中で止まったもの(10分以上 posting のまま)は失敗にする
+    env.DB.prepare("UPDATE scheduled_posts SET status = 'failed', error = ?, updated_at = ? WHERE status = 'posting' AND updated_at < ?").bind('投稿の途中で止まりました。投稿されたかどうかをSNSで確認してください。', new Date(now).toISOString(), new Date(now - stuckMs).toISOString()),
+    // 投稿済みは7日で一覧から消す
+    env.DB.prepare("DELETE FROM scheduled_posts WHERE status = 'posted' AND updated_at < ?").bind(new Date(now - postedKeepMs).toISOString()),
+    env.DB.prepare("SELECT id FROM scheduled_posts WHERE status = 'pending' AND scheduled_at <= ? ORDER BY scheduled_at LIMIT ?").bind(new Date(now).toISOString(), scheduleMaxPerRun),
+  ])
+  for (const row of due.results) await runSchedule(env, row.id, ['pending'])
+}
+
+async function handleSchedule(handler) {
+  try {
+    return await handler()
+  } catch (scheduleError) {
+    console.error(scheduleError)
+    return json({ error: scheduleError.message || '予約の処理に失敗しました。' }, scheduleError.status || 500)
+  }
+}
+
 function status(data) {
   return json({ connected: Boolean(data?.accessToken), userId: data?.userId || null, username: data?.username || null, name: data?.name || null, profile: data?.profile || null })
 }
 
 async function route(request, env, session, url) {
   const key = `${request.method} ${url.pathname}`
+  // /api/schedules/{ID}(削除)と /api/schedules/{ID}/post(今すぐ投稿)
+  const scheduleMatch = url.pathname.match(/^\/api\/schedules\/([0-9a-f]{32})(\/post)?$/)
+  if (scheduleMatch && request.method === 'DELETE' && !scheduleMatch[2]) return handleSchedule(() => deleteSchedule(env, scheduleMatch[1]))
+  if (scheduleMatch && request.method === 'POST' && scheduleMatch[2]) return handleSchedule(() => postScheduleNow(env, scheduleMatch[1]))
   switch (key) {
+    case 'GET /api/schedules': return handleSchedule(() => listSchedules(env))
+    case 'POST /api/schedules': return handleSchedule(() => createSchedule(request, env, session))
     case 'GET /api/x/status': return status(session.data)
     case 'GET /api/x/connect': return xConnect(request, env)
     case 'GET /api/x/callback': return xCallback(request, env, session, url)
@@ -560,5 +750,9 @@ export default {
     const response = await route(request, env, session, url)
     await saveThreadsCalls(session, env).catch((saveError) => console.error(saveError))
     return finish(session, env, response)
+  },
+  // Cron Trigger(wrangler.jsonc の triggers.crons)。予定時刻を過ぎた予約を投稿する
+  async scheduled(controller, env) {
+    await runDueSchedules(env)
   },
 }

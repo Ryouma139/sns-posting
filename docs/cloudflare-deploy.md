@@ -108,6 +108,15 @@ OAuth のコールバックは HTTPS が前提のため、「HTTPS を自分で�
 
 [wrangler.jsonc](../wrangler.jsonc) の `kv_namespaces` は id を書いていないため、初回のデプロイで自動作成された。管理画面での作業は不要だった。使われ方は5章。
 
+### D1 と Cron Trigger(予約投稿)
+
+予約投稿の自動化で、[wrangler.jsonc](../wrangler.jsonc) に `d1_databases`(`DB`、データベース名 `sns-posting`)と `triggers.crons`(`* * * * *` = 毎分)を追加した。
+
+- D1 も KV と同じく `database_id` を書いていないので、**次のデプロイで自動作成される**。テーブルは Worker が最初に使うときに作るので、マイグレーションのコマンドは不要。
+- 作られたかどうかは **Storage & Databases → D1** で、Cron は **Workers & Pages → sns-posting → Settings → Trigger Events** で確認できる。
+- Cron は Cloudflare の中から Worker を呼ぶため、**Cloudflare Access を通らない**。Bypass の設定は不要。
+- 仕組みは [app-features.md](app-features.md) の3章。
+
 ### 確認方法
 
 ```text

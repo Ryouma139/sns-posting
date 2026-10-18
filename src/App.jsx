@@ -138,11 +138,17 @@ function App() {
   const connectResultRef = useRef(null)
   const unreadCount = notifications.filter((item) => !item.read).length
   const [isPosting, setIsPosting] = useState(false)
-  const [scheduledPosts, setScheduledPosts] = useState(() => loadStoredList(scheduledStorageKey))
+  // 予約は Worker の DB に保存し、予定時刻に自動で投稿される(status: pending / posting / posted / failed)
+  const [schedules, setSchedules] = useState([])
+  const [schedulesError, setSchedulesError] = useState('')
+  // 自動投稿に対応する前に、このブラウザ(localStorage)に保存した予約。そのアカウントを連携すると DB に移す
+  const [localSchedules, setLocalSchedules] = useState(() => loadStoredList(scheduledStorageKey))
+  const migratingRef = useRef(new Set())
   const [isScheduleOpen, setIsScheduleOpen] = useState(false)
   const [scheduleAt, setScheduleAt] = useState('')
-  // 予約は選択中のワークスペース(SNS)の分だけ表示する。以前の予約はXとして扱う
-  const sortedScheduledPosts = scheduledPosts.filter((item) => (item.platform || 'x') === platform).sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt))
+  // 予約は選択中のワークスペース(SNS)の分だけ表示する。以前の予約はXとして扱う。投稿済みは下にまとめる
+  const scheduledPosts = [...schedules, ...localSchedules.map((item) => ({ ...item, isLocal: true }))]
+  const sortedScheduledPosts = scheduledPosts.filter((item) => (item.platform || 'x') === platform).sort((a, b) => (a.status === 'posted') - (b.status === 'posted') || new Date(a.scheduledAt) - new Date(b.scheduledAt))
   // 連携中のアカウントで予約したものと、それ以外(別アカウント・アカウント不明)に分ける
   const ownScheduledPosts = sortedScheduledPosts.filter((item) => isSameAccount(item, accounts[platform]) === true)
   const otherScheduledPosts = sortedScheduledPosts.filter((item) => isSameAccount(item, accounts[platform]) !== true)
@@ -234,9 +240,9 @@ function App() {
     else window.scrollTo(0, 0)
   }, [route])
 
-  // 通知と予約投稿はこのブラウザのlocalStorageに保存する
+  // 通知と下書きはこのブラウザのlocalStorageに保存する(予約は DB。古い予約だけ localStorage に残る)
   useEffect(() => saveStoredList(notificationStorageKey, notifications), [notifications])
-  useEffect(() => saveStoredList(scheduledStorageKey, scheduledPosts), [scheduledPosts])
+  useEffect(() => saveStoredList(scheduledStorageKey, localSchedules), [localSchedules])
   useEffect(() => saveStoredList(draftStorageKey, drafts), [drafts])
   useEffect(() => {
     try {
@@ -276,6 +282,40 @@ function App() {
     setIsNoticeError(true)
     setNotice(message)
   }
+
+  // 予約の一覧は概要画面を開いたときと「更新」を押したときに読み込む(自動投稿の結果もここで反映される)
+  const loadSchedules = async () => {
+    try {
+      const response = await fetch('/api/schedules')
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || `エラー ${response.status}`)
+      setSchedules(result.schedules)
+      setSchedulesError('')
+    } catch (loadError) {
+      setSchedulesError(loadError.message || '予約を読み込めませんでした。')
+    }
+  }
+
+  useEffect(() => {
+    if (view === 'dashboard') loadSchedules()
+  }, [view])
+
+  // localStorage の古い予約を、予約したアカウントを連携しているときに DB へ移す(予定時刻を過ぎたものは「失敗」として移る)
+  useEffect(() => {
+    for (const item of localSchedules) {
+      const target = item.platform || 'x'
+      if (isSameAccount(item, accounts[target]) !== true || migratingRef.current.has(item.id)) continue
+      migratingRef.current.add(item.id)
+      fetch('/api/schedules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ platform: target, text: item.text, topicTag: item.topicTag || '', scheduledAt: item.scheduledAt, migrated: true }) })
+        .then(async (response) => {
+          const result = await response.json()
+          if (!response.ok) throw new Error(result.error)
+          setSchedules((current) => [...current, result.schedule])
+          setLocalSchedules((current) => current.filter((local) => local.id !== item.id))
+        })
+        .catch(() => migratingRef.current.delete(item.id))
+    }
+  }, [accounts, localSchedules])
 
   const archiveLimit = 20
   // APIの利用量(Xはクレジット)を抑えるため、ボタンを押したときだけ取得する
@@ -560,15 +600,28 @@ function App() {
     setIsScheduleOpen(true)
   }
 
-  const handleSchedule = (event) => {
+  const [isScheduling, setIsScheduling] = useState(false)
+  const handleSchedule = async (event) => {
     event.preventDefault()
     const scheduledAt = new Date(scheduleAt)
-    if (!post.trim() || isOverLimit || Number.isNaN(scheduledAt.getTime())) return
+    if (!post.trim() || isOverLimit || isScheduling || Number.isNaN(scheduledAt.getTime())) return
     if (scheduledAt <= new Date()) { showError('予約日時は現在より後の日時を指定してください。'); return }
     if (!isConnected) { showError(`予約するには${platformInfo.label}アカウントを連携してください。`); return }
-    // どのアカウントで予約したかを残し、別のアカウントから投稿しないようにする
-    const item = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, platform, accountId: accounts[platform].userId, accountUsername: username, text: post.trim(), topicTag: platform === 'threads' ? topicTag.trim().replace(/^#+/, '') : '', scheduledAt: scheduledAt.toISOString(), createdAt: new Date().toISOString() }
-    setScheduledPosts((current) => [...current, item])
+    // Worker が連携中のアカウントを予約に記録し、予定時刻にそのアカウントで投稿する
+    setIsScheduling(true)
+    let item
+    try {
+      const response = await fetch('/api/schedules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ platform, text: post.trim(), topicTag: platform === 'threads' ? topicTag.trim().replace(/^#+/, '') : '', scheduledAt: scheduledAt.toISOString() }) })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || `エラー ${response.status}`)
+      item = result.schedule
+    } catch (scheduleError) {
+      showError(`予約できませんでした: ${scheduleError.message || 'APIサーバーに接続できません。'}`)
+      return
+    } finally {
+      setIsScheduling(false)
+    }
+    setSchedules((current) => [...current, item])
     setIsScheduleOpen(false)
     setPost('')
     setTopicTag('')
@@ -580,9 +633,41 @@ function App() {
     window.setTimeout(() => setNotice(''), 3000)
   }
 
-  const removeScheduled = (id) => setScheduledPosts((current) => current.filter((item) => item.id !== id))
+  const removeScheduled = async (item) => {
+    if (item.isLocal) { setLocalSchedules((current) => current.filter((local) => local.id !== item.id)); return }
+    try {
+      const response = await fetch(`/api/schedules/${item.id}`, { method: 'DELETE' })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || `エラー ${response.status}`)
+      setSchedules((current) => current.filter((schedule) => schedule.id !== item.id))
+    } catch (deleteError) {
+      showError(`予約を削除できませんでした: ${deleteError.message || 'APIサーバーに接続できません。'}`)
+    }
+  }
+
+  // DB の予約の「今すぐ投稿」は Worker が予約したアカウントのトークンで投稿する(連携中のアカウントでなくてよい)
+  const publishSavedSchedule = async (item) => {
+    const label = platforms[item.platform].label
+    setIsPosting(true)
+    try {
+      const response = await fetch(`/api/schedules/${item.id}/post`, { method: 'POST' })
+      const result = await response.json()
+      if (result.schedule) setSchedules((current) => current.map((schedule) => schedule.id === item.id ? result.schedule : schedule))
+      if (!response.ok) throw new Error(result.error || `エラー ${response.status}`)
+      addNotification('success', `${label}へ投稿しました`, [item.text, item.topicTag ? `#${item.topicTag}` : ''].filter(Boolean).join(' · '))
+      setIsNoticeError(false)
+      setNotice(`${label}へ投稿しました`)
+      window.setTimeout(() => setNotice(''), 3000)
+    } catch (postError) {
+      showError(`${label}への投稿に失敗しました: ${postError.message || 'APIサーバーに接続できません。'}`)
+      addNotification('error', `${label}への投稿に失敗しました`, postError.message || '')
+    } finally {
+      setIsPosting(false)
+    }
+  }
 
   const publishScheduled = async (item) => {
+    if (!item.isLocal) { await publishSavedSchedule(item); return }
     const target = item.platform || 'x'
     const account = accounts[target]
     const same = isSameAccount(item, account)
@@ -593,23 +678,36 @@ function App() {
       return
     }
     if (same === null && !window.confirm(`予約したアカウントが記録されていない予約です。連携中の @${account.username} から投稿しますか？`)) return
-    if (await publishPost(item.text, target, item.accountId || '', [], item.topicTag || '')) removeScheduled(item.id)
+    if (await publishPost(item.text, target, item.accountId || '', [], item.topicTag || '')) removeScheduled(item)
+  }
+
+  // 予約の状態ごとの表示
+  const scheduleStatusPill = (item) => {
+    const isOverdue = new Date(item.scheduledAt) <= new Date()
+    if (item.isLocal) return <span className="draft-pill overdue-pill"><AlertCircle size={13} /> {isOverdue ? '予定時刻を過ぎています' : 'このブラウザだけの予約'}(自動投稿されません)</span>
+    if (item.status === 'posted') return <span className="scheduled-pill posted-pill"><Check size={13} /> 投稿済み</span>
+    if (item.status === 'failed') return <span className="draft-pill overdue-pill"><AlertCircle size={13} /> 投稿できませんでした</span>
+    if (item.status === 'posting' || isOverdue) return <span className="scheduled-pill"><Send size={13} /> 投稿中</span>
+    return <span className="scheduled-pill"><Clock3 size={13} /> 予約済み</span>
   }
 
   // showAccount: 別アカウント・アカウント不明の予約には、予約したアカウント名を表示する
   const renderScheduledRow = (item, showAccount) => {
     const date = new Date(item.scheduledAt)
-    const isOverdue = date <= new Date()
+    // DB の予約は連携していなくても投稿できる(予約したアカウントのトークンを使う)。投稿中・投稿済みは押せない
+    const canPost = item.isLocal ? isConnected : item.status === 'pending' || item.status === 'failed'
+    const postTitle = item.isLocal && !isConnected ? `${platformInfo.label}アカウントを連携すると投稿できます` : item.status === 'failed' ? 'もう一度投稿' : '今すぐ投稿'
     return (
-      <div className="upcoming-row archive-row" key={item.id}>
+      <div className={`upcoming-row archive-row${item.status === 'posted' ? ' posted-row' : ''}`} key={item.id}>
         <div className="date-block"><b>{date.getDate()}</b><span>{date.getMonth() + 1}月</span></div>
         <div className="upcoming-content">
-          <div className="upcoming-meta">{isOverdue ? <span className="draft-pill overdue-pill"><AlertCircle size={13} /> 予定時刻を過ぎています</span> : <span className="scheduled-pill"><Clock3 size={13} /> 予約済み</span>}{item.topicTag && <span className="draft-pill account-pill-small">#{item.topicTag}</span>}{showAccount && <span className="draft-pill account-pill-small">{item.accountUsername ? `@${item.accountUsername}` : 'アカウント不明'}</span>}<span>{formatScheduledAt(item.scheduledAt)}</span></div>
+          <div className="upcoming-meta">{scheduleStatusPill(item)}{item.topicTag && <span className="draft-pill account-pill-small">#{item.topicTag}</span>}{showAccount && <span className="draft-pill account-pill-small">{item.accountUsername ? `@${item.accountUsername}` : 'アカウント不明'}</span>}<span>{formatScheduledAt(item.scheduledAt)}{item.status === 'posted' && item.updatedAt ? ` · ${formatScheduledAt(item.updatedAt)} に投稿` : ''}</span></div>
           <p>{item.text}</p>
+          {item.status === 'failed' && item.error && <p className="schedule-error">{item.error}</p>}
         </div>
         <div className="scheduled-actions">
-          <button className="more-button" disabled={!isConnected || isPosting} onClick={() => publishScheduled(item)} aria-label="今すぐ投稿" title={isConnected ? '今すぐ投稿' : `${platformInfo.label}アカウントを連携すると投稿できます`}><Send size={16} /></button>
-          <button className="more-button" onClick={() => removeScheduled(item.id)} aria-label="予約を削除" title="予約を削除"><Trash2 size={16} /></button>
+          {item.status !== 'posted' && item.status !== 'posting' && <button className="more-button" disabled={!canPost || isPosting} onClick={() => publishScheduled(item)} aria-label={postTitle} title={postTitle}><Send size={16} /></button>}
+          <button className="more-button" disabled={item.status === 'posting'} onClick={() => removeScheduled(item)} aria-label={item.status === 'posted' ? '一覧から消す' : '予約を削除'} title={item.status === 'posted' ? '一覧から消す' : '予約を削除'}><Trash2 size={16} /></button>
         </div>
       </div>
     )
@@ -694,8 +792,9 @@ function App() {
             <section className="intro"><div><p className="eyebrow">{today}</p><h1>おはようございます、{displayName}<span>。</span></h1><p className="subcopy">次のストーリーを、みんなに届けましょう。</p></div><button className="outline-button"><Command size={16} /> ショートカット <kbd>⌘ K</kbd></button></section>
               {connectionCard}
               <div className="section-heading"><div><p className="eyebrow">クイックアクション</p><h2>何を投稿しますか？</h2></div><a className="connect-button quick-compose" href="#compose"><PenLine size={16} /> 投稿を作成</a></div>
-            <section className="lower-grid single"><div className="recent-section"><div className="section-heading compact scheduled-heading"><div><p className="eyebrow">次の投稿 · このブラウザで予約</p><h2>予約済みの投稿</h2></div><a href="#compose">予約を追加 <PenLine size={14} /></a></div>
-              {sortedScheduledPosts.length === 0 && <p className="archive-empty">予約した投稿はありません。作成画面の「予約投稿」から追加できます。</p>}
+            <section className="lower-grid single"><div className="recent-section"><div className="section-heading compact scheduled-heading"><div><p className="eyebrow">次の投稿 · 予定時刻に自動で投稿</p><h2>予約済みの投稿</h2></div><span className="scheduled-links"><button type="button" className="text-button" onClick={loadSchedules}>更新</button><a href="#compose">予約を追加 <PenLine size={14} /></a></span></div>
+              {schedulesError && <p className="archive-empty schedule-error">予約を読み込めませんでした: {schedulesError}</p>}
+              {sortedScheduledPosts.length === 0 && !schedulesError && <p className="archive-empty">予約した投稿はありません。作成画面の「予約投稿」から追加できます。</p>}
               {ownScheduledPosts.map((item) => renderScheduledRow(item, false))}
               {otherScheduledPosts.length > 0 && <p className="eyebrow scheduled-group-label">{isConnected ? 'ほかのアカウントの予約' : '連携するアカウントの予約'}</p>}
               {otherScheduledPosts.map((item) => renderScheduledRow(item, true))}
@@ -742,8 +841,8 @@ function App() {
                 <form className="schedule-popover" onSubmit={handleSchedule}>
                   <label htmlFor="schedule-at">投稿する日時</label>
                   <input id="schedule-at" type="datetime-local" value={scheduleAt} min={toLocalInputValue(new Date())} onChange={(event) => setScheduleAt(event.target.value)} required />
-                  <p>予約はこのブラウザに保存されます。</p>
-                  <div><button type="button" className="outline-button" onClick={() => setIsScheduleOpen(false)}>キャンセル</button><button type="submit" className="post-button" disabled={!scheduleAt}>予約する</button></div>
+                  <p>予定時刻になると自動で投稿されます(1分ほど遅れることがあります)。画像は予約できません。</p>
+                  <div><button type="button" className="outline-button" onClick={() => setIsScheduleOpen(false)}>キャンセル</button><button type="submit" className="post-button" disabled={!scheduleAt || isScheduling}>{isScheduling ? '予約中...' : '予約する'}</button></div>
                 </form>
               )}</span><button className="post-button" disabled={!isConnected || (!post.trim() && images.length === 0) || isOverLimit || Boolean(topicTagError) || isPosting} onClick={handlePost}><Send size={16} /> {isPosting ? '投稿中...' : '今すぐ投稿'}</button></div></div></div><aside className="preview-card"><div className="preview-label"><span>プレビュー</span><span className="live-dot">LIVE</span></div><div className="preview-post"><div className="preview-user"><span className="avatar peach">{initial}</span><div><b>{isConnected ? displayName : 'あなたのアカウント'}</b><span>@{isConnected ? username : 'username'} · 今</span></div><span className="preview-x">{platformInfo.symbol}</span></div><p>{post || (images.length ? '' : '入力した投稿内容がここに表示されます。')}</p>{platform === 'threads' && cleanTopicTag && !topicTagError && <span className="preview-topic-tag"><Hash size={12} />{cleanTopicTag}</span>}{images.length > 0 && <div className={`preview-images count-${images.length}`}>{images.map((item) => <img key={item.id} src={item.url} alt="" />)}</div>}<div className="preview-actions"><span>♡ 0</span><span>↻ 0</span><span>♧ 0</span><MoreHorizontal size={15} /></div></div><div className="preview-tip"><Sparkles size={15} /><span><b>印象に残る投稿に</b><br />短く、わかりやすく、あなたらしく。</span></div></aside></section>
             </>

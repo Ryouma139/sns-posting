@@ -4,8 +4,8 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"wrangler dev --port 8787\" \"vite\"",
-    "dev:server": "wrangler dev --port 8787",
+    "dev": "concurrently \"wrangler dev --port 8787 --test-scheduled\" \"vite\"",
+    "dev:server": "wrangler dev --port 8787 --test-scheduled",
     "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview",

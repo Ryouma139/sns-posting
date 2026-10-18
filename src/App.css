@@ -2004,3 +2004,39 @@ button.profile[aria-expanded='true'] {
   font-size: 11px;
   font-weight: 600;
 }
+
+/* 予約投稿(自動投稿)の一覧 */
+.scheduled-links {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.section-heading.compact .text-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.section-heading.compact .text-button:hover {
+  color: var(--coral);
+}
+
+.posted-pill {
+  background: #e7f6ee;
+  color: #2f8a5b;
+}
+
+.posted-row {
+  opacity: 0.7;
+}
+
+.upcoming-content .schedule-error,
+.schedule-error {
+  color: var(--coral-dark);
+  font-size: 11px;
+}
