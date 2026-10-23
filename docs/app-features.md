@@ -1,6 +1,6 @@
 # アプリの機能と仕様
 
-ダッシュボードの各機能の仕組みと制限のまとめ。Threads API の連携手順は [threads-api.md](threads-api.md) を参照。
+ダッシュボードの各機能の仕組みと制限のまとめ。Threads API の連携手順は [threads-api.md](threads-api.md) を参照。KV・D1・R2 と予約投稿のコードは [cloudflare-storage.md](cloudflare-storage.md) を参照。
 
 ## 1. API 利用状況の画面
 
