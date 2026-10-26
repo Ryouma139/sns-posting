@@ -321,6 +321,35 @@ nav .nav-label:nth-of-type(2) {
   font-weight: 700;
 }
 
+/* スマホ用のワークスペースの切り替え(サイドバーを隠す 680px 以下で表示) */
+.mobile-workspace {
+  display: none;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #f8f9fb;
+}
+
+.mobile-workspace button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border: 0;
+  border-radius: 999px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.mobile-workspace button.active {
+  color: var(--accent);
+  background: #fff;
+  box-shadow: var(--shadow-sm);
+}
+
 .top-actions {
   display: flex;
   align-items: center;
@@ -1671,8 +1700,12 @@ button.profile[aria-expanded='true'] {
 }
 
 @media (max-width: 680px) {
-  .sidebar {
+  .sidebar,
+  .breadcrumbs {
     display: none;
+  }
+  .mobile-workspace {
+    display: flex;
   }
   .topbar {
     height: 65px;

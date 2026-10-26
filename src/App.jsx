@@ -747,7 +747,7 @@ function App() {
         <div className="sidebar-foot"><div className="help-icon"><Sparkles size={17} /></div><div><strong>お困りですか？</strong><small>クイックガイドを読む</small></div><ExternalLink size={14} /></div>
       </aside>
       <main className="main-content" id="dashboard">
-        <header className="topbar"><div className="breadcrumbs"><span>ワークスペース</span><span>/</span><b>{pageTitles[view]}</b></div><div className="top-actions"><div className="profile-menu-wrap" ref={notificationMenuRef}>
+        <header className="topbar">{/* スマホではサイドバーを隠すので、ワークスペース(SNS)の切り替えをここに出す */}<div className="mobile-workspace" role="group" aria-label="ワークスペースを切り替え">{platformKeys.map((key) => <button key={key} type="button" aria-pressed={key === platform} className={key === platform ? 'active' : undefined} onClick={() => switchPlatform(key)}><span aria-hidden="true">{platforms[key].symbol}</span>{platforms[key].label}</button>)}</div><div className="breadcrumbs"><span>ワークスペース</span><span>/</span><b>{pageTitles[view]}</b></div><div className="top-actions"><div className="profile-menu-wrap" ref={notificationMenuRef}>
               <button className="icon-button" aria-label={unreadCount ? `通知(未読${unreadCount}件)` : '通知'} aria-expanded={isNotificationsOpen} aria-haspopup="dialog" onClick={() => { setIsNotificationsOpen((open) => !open); setIsProfileOpen(false) }}><Bell size={18} />{unreadCount > 0 && <i />}</button>
               {isNotificationsOpen && (
                 <div className="profile-menu notification-menu" role="dialog" aria-label="通知">
